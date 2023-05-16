@@ -7,7 +7,7 @@ use std::process::exit;
 
 fn main() {
     // queries
-    let queries: Vec<(&str, i32)> = [
+    let queries: Vec<(&str, usize)> = [
         ("create table test (pk int, `value` int, primary key(pk))", 0),
         ("describe test", 3),
         ("insert into test (pk, `value`) values (0,0)", 1),
@@ -51,12 +51,12 @@ fn main() {
         let result = conn.query(query);
         let response : Vec<Row> = result.expect("Error: bad response");
         println!("{:?}", response);
-        //if response.len() != exp_result {
+        if response.len() != *exp_result {
             println!("QUERY: {}", query);
             println!("EXPECTED: {}", exp_result);
             println!("RESULT: {:?}", response);
             exit(1)
-        //}
+        }
     }
     exit(0)
 
