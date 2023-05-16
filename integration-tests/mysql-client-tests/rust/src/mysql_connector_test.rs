@@ -30,6 +30,7 @@ fn main() {
     let port = &args[2];
     let db = &args[3];
 
+    /*
     // open connection
     let client: HashMap<String, String> = HashMap::from([
         (String::from("user"), String::from(user)),
@@ -41,9 +42,11 @@ fn main() {
     //let url = "mysql://" + user + "@localhost:127.0.0.1/" + db;
     //let pool = Pool::new(url).unwrap();
     let conn = builder_result.expect("Error: bad connection");
-    // let mut conn = builder.get_conn().unwrap();
-
-    let pool = Pool::new(conn).unwrap();
+    // let mut connection_opts = builder.get_conn().unwrap();
+    */
+    let url = format!("mysql://{}@localhost:{}/{}", user, port, db);
+    let connection_opts = mysql::Opts::from_url(&url).unwrap();
+    let pool = Pool::new(connection_opts).unwrap();
     let mut conn = pool.get_conn().unwrap();
 
     // for query in query_response...execute query
