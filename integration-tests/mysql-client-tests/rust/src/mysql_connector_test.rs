@@ -5,12 +5,9 @@ use mysql::prelude::*;
 use std::env;
 use std::process::exit;
 
-use std::collections::HashMap;
-
-
 fn main() {
     // queries
-    let queries: HashMap<&str, i32> = HashMap::from([
+    let queries: Vec<(&str, i32)> = [
         ("create table test (pk int, `value` int, primary key(pk))", 0),
         ("describe test", 3),
         ("insert into test (pk, `value`) values (0,0)", 1),
@@ -23,7 +20,7 @@ fn main() {
         ("call dolt_checkout('main')", 1),
         ("call dolt_merge('mybranch')", 1),
         ("select COUNT(*) FROM dolt_log", 1)
-    ]);
+    ].to_vec();
     // get CL args
     let args: Vec<String> = env::args().collect();
     let user = &args[1];
