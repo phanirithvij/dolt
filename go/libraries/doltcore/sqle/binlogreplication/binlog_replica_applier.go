@@ -289,12 +289,11 @@ func (a *binlogReplicaApplier) replicaBinlogEventHandler(ctx *sql.Context) error
 
 		case err := <-eventProducer.ErrorChan():
 			if sqlError, isSqlError := err.(*mysql.SQLError); isSqlError {
-				if sqlError.Message == io.EOF.Error() {
-					ctx.GetLogger().Trace("No more binlog messages; retrying in 1s...")
-					time.Sleep(1 * time.Second)
-				} else if strings.HasPrefix(sqlError.Message, io.ErrUnexpectedEOF.Error()) {
+				badConnection := sqlError.Message == io.EOF.Error() ||
+					strings.HasPrefix(sqlError.Message, io.ErrUnexpectedEOF.Error())
+				if badConnection {
 					DoltBinlogReplicaController.updateStatus(func(status *binlogreplication.ReplicaStatus) {
-						status.LastIoError = io.ErrUnexpectedEOF.Error()
+						status.LastIoError = sqlError.Message
 						status.LastIoErrNumber = ERNetReadError
 						currentTime := time.Now()
 						status.LastIoErrorTimestamp = &currentTime
@@ -707,7 +706,7 @@ func closeWriteSession(ctx *sql.Context, engine *gms.Engine, databaseName string
 		return err
 	}
 
-	return sqlDatabase.DbData().Ddb.UpdateWorkingSet(ctx, newWorkingSet.Ref(), newWorkingSet, hash, newWorkingSet.Meta())
+	return sqlDatabase.DbData().Ddb.UpdateWorkingSet(ctx, newWorkingSet.Ref(), newWorkingSet, hash, newWorkingSet.Meta(), nil)
 }
 
 // getTableSchema returns a sql.Schema for the specified table in the specified database.

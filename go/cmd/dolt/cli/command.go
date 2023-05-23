@@ -22,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/fatih/color"
 
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
@@ -32,7 +33,7 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func isHelp(str string) bool {
+func IsHelp(str string) bool {
 	str = strings.TrimSpace(str)
 
 	if len(str) == 0 {
@@ -50,7 +51,7 @@ func isHelp(str string) bool {
 
 func hasHelpFlag(args []string) bool {
 	for _, arg := range args {
-		if isHelp(arg) {
+		if IsHelp(arg) {
 			return true
 		}
 	}
@@ -78,6 +79,12 @@ type SignalCommand interface {
 
 	// InstallsSignalHandlers returns whether this command manages its own signal handlers for interruption / termination.
 	InstallsSignalHandlers() bool
+}
+
+// Queryist is generic interface for executing queries. Commands will be provided a Queryist to perform any work using
+// SQL. The Queryist can be obtained from the CliContext passed into the Exec method by calling the QueryEngine method.
+type Queryist interface {
+	Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error)
 }
 
 // This type is to store the content of a documented command, elsewhere we can transform this struct into
@@ -171,7 +178,7 @@ func (hc SubCommandHandler) Hidden() bool {
 
 func (hc SubCommandHandler) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx CliContext) int {
 	if len(args) < 1 && hc.Unspecified == nil {
-		hc.printUsage(commandStr)
+		hc.PrintUsage(commandStr)
 		return 1
 	}
 
@@ -190,12 +197,12 @@ func (hc SubCommandHandler) Exec(ctx context.Context, commandStr string, args []
 		return hc.handleCommand(ctx, commandStr, hc.Unspecified, args, dEnv, cliCtx)
 	}
 
-	if !isHelp(subCommandStr) {
+	if !IsHelp(subCommandStr) {
 		PrintErrln(color.RedString("Unknown Command " + subCommandStr))
 		return 1
 	}
 
-	hc.printUsage(commandStr)
+	hc.PrintUsage(commandStr)
 	return 0
 }
 
@@ -302,7 +309,7 @@ func CheckUserNameAndEmail(dEnv *env.DoltEnv) bool {
 	return true
 }
 
-func (hc SubCommandHandler) printUsage(commandStr string) {
+func (hc SubCommandHandler) PrintUsage(commandStr string) {
 	Println("Valid commands for", commandStr, "are")
 
 	for _, cmd := range hc.Subcommands {

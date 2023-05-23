@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	sqle "github.com/dolthub/go-mysql-server"
@@ -25,7 +26,7 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/store/types"
+	storetypes "github.com/dolthub/dolt/go/store/types"
 )
 
 type conflictKind byte
@@ -36,19 +37,10 @@ const (
 	ColumnCheckCollision
 	InvalidCheckCollision
 	DeletedCheckCollision
+	// DuplicateIndexColumnSet represent a schema conflict where multiple indexes cover the same set of columns, and
+	// we're unable to accurately match them up on each side of the merge, so the user has to manually resolve.
+	DuplicateIndexColumnSet
 )
-
-// todo: link to docs explaining how to resolve schema conflicts.
-func SchemaConflictErr(cc ...SchemaConflict) error {
-	var sb strings.Builder
-	sb.WriteString("merge aborted: schema conflict found for tables: \n")
-	for i := range cc {
-		sb.WriteRune('\t')
-		sb.WriteString(cc[i].TableName)
-		sb.WriteRune('\n')
-	}
-	return errors.New(sb.String())
-}
 
 type SchemaConflict struct {
 	TableName    string
@@ -63,21 +55,37 @@ func (sc SchemaConflict) Count() int {
 	return len(sc.ColConflicts) + len(sc.IdxConflicts) + len(sc.ChkConflicts)
 }
 
+// String implements fmt.Stringer. This method is used to
+// display schema conflicts on schema conflict read paths.
+func (sc SchemaConflict) String() string {
+	return strings.Join(sc.messages(), "\n")
+}
+
+// Error implements error. This error will be returned to the
+// user if merge is configured to error upon schema conflicts.
+// todo: link to docs explaining how to resolve schema conflicts.
 func (sc SchemaConflict) Error() string {
+	template := "merge aborted: schema conflict found for table %s \n" +
+		" please resolve schema conflicts before merging: %s"
 	var b strings.Builder
-	b.WriteString("merge aborted: schema conflict found for table ")
-	b.WriteString(sc.TableName)
-	b.WriteString("\n please resolve schema conflicts before merging")
+	for _, m := range sc.messages() {
+		b.WriteString("\n\t")
+		b.WriteString(m)
+	}
+	return fmt.Sprintf(template, sc.TableName, b.String())
+}
+
+func (sc SchemaConflict) messages() (mm []string) {
 	for _, c := range sc.ColConflicts {
-		b.WriteString(fmt.Sprintf("\t%s\n", c.String()))
+		mm = append(mm, c.String())
 	}
 	for _, c := range sc.IdxConflicts {
-		b.WriteString(fmt.Sprintf("\t%s\n", c.String()))
+		mm = append(mm, c.String())
 	}
 	for _, c := range sc.ChkConflicts {
-		b.WriteString(fmt.Sprintf("\t%s\n", c.String()))
+		mm = append(mm, c.String())
 	}
-	return b.String()
+	return
 }
 
 type ColConflict struct {
@@ -88,7 +96,7 @@ type ColConflict struct {
 func (c ColConflict) String() string {
 	switch c.Kind {
 	case NameCollision:
-		return fmt.Sprintf("two columns with the same name '%s' have different tags. See https://github.com/dolthub/dolt/issues/3963", c.Ours.Name)
+		return fmt.Sprintf("incompatible column types for column '%s': %s and %s", c.Ours.Name, c.Ours.TypeInfo, c.Theirs.TypeInfo)
 	case TagCollision:
 		return fmt.Sprintf("different column definitions for our column %s and their column %s", c.Ours.Name, c.Theirs.Name)
 	}
@@ -101,7 +109,12 @@ type IdxConflict struct {
 }
 
 func (c IdxConflict) String() string {
-	return ""
+	switch c.Kind {
+	case DuplicateIndexColumnSet:
+		return fmt.Sprintf("multiple indexes covering the same column set cannot be merged: '%s' and '%s'", c.Ours.Name(), c.Theirs.Name())
+	default:
+		return ""
+	}
 }
 
 type FKConflict struct {
@@ -135,7 +148,7 @@ func (c ChkConflict) String() string {
 var ErrMergeWithDifferentPks = errors.New("error: cannot merge two tables with different primary keys")
 
 // SchemaMerge performs a three-way merge of ourSch, theirSch, and ancSch.
-func SchemaMerge(ctx context.Context, format *types.NomsBinFormat, ourSch, theirSch, ancSch schema.Schema, tblName string) (sch schema.Schema, sc SchemaConflict, err error) {
+func SchemaMerge(ctx context.Context, format *storetypes.NomsBinFormat, ourSch, theirSch, ancSch schema.Schema, tblName string) (sch schema.Schema, sc SchemaConflict, err error) {
 	// (sch - ancSch) ∪ (mergeSch - ancSch) ∪ (sch ∩ mergeSch)
 	sc = SchemaConflict{
 		TableName: tblName,
@@ -148,7 +161,7 @@ func SchemaMerge(ctx context.Context, format *types.NomsBinFormat, ourSch, their
 	}
 
 	var mergedCC *schema.ColCollection
-	mergedCC, sc.ColConflicts, err = mergeColumns(ourSch.GetAllCols(), theirSch.GetAllCols(), ancSch.GetAllCols())
+	mergedCC, sc.ColConflicts, err = mergeColumns(format, ourSch.GetAllCols(), theirSch.GetAllCols(), ancSch.GetAllCols())
 	if err != nil {
 		return nil, SchemaConflict{}, err
 	}
@@ -232,7 +245,7 @@ func ForeignKeysMerge(ctx context.Context, mergedRoot, ourRoot, theirRoot, ancRo
 		return nil, nil, err
 	}
 
-	common, conflicts, err := foreignKeysInCommon(ours, theirs, anc)
+	common, conflicts, err := foreignKeysInCommon(ours, theirs, anc, ancSchs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -299,14 +312,22 @@ func ForeignKeysMerge(ctx context.Context, mergedRoot, ourRoot, theirRoot, ancRo
 // mergeColumns merges the columns from |ourCC|, |theirCC| into a single column collection, using the ancestor column
 // definitions in |ancCC| to determine on which side a column has changed. If merging is not possible because of
 // conflicting changes to the columns in |ourCC| and |theirCC|, then a set of ColConflict instances are returned
-// describing the conflicts. If any other, unexpected error occurs, then that error is returned and the other response
-// fields should be ignored.
-func mergeColumns(ourCC, theirCC, ancCC *schema.ColCollection) (*schema.ColCollection, []ColConflict, error) {
-	columnMappings := mapColumns(ourCC, theirCC, ancCC)
-	conflicts, err := checkColumnMappingsForConflicts(columnMappings)
+// describing the conflicts. |format| indicates what storage format is in use, and is needed to determine compatibility
+// between types, since different storage formats have different restrictions on how much types can change and remain
+// compatible with the current stored format. If any unexpected error occurs, then that error is returned and the
+// other response fields should be ignored.
+func mergeColumns(format *storetypes.NomsBinFormat, ourCC, theirCC, ancCC *schema.ColCollection) (*schema.ColCollection, []ColConflict, error) {
+	columnMappings, err := mapColumns(ourCC, theirCC, ancCC)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	conflicts, err := checkSchemaConflicts(columnMappings)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	compatChecker := newTypeCompatabilityCheckerForStorageFormat(format)
 
 	// After we've checked for schema conflicts, merge the columns together
 	// TODO: We don't currently preserve all column position changes; the returned merged columns are always based on
@@ -334,10 +355,33 @@ func mergeColumns(ourCC, theirCC, ancCC *schema.ColCollection) (*schema.ColColle
 				oursChanged := !anc.Equals(*ours)
 				theirsChanged := !anc.Equals(*theirs)
 				if oursChanged && theirsChanged {
-					// This is a schema change conflict and has already been handled by checkColumnMappingsForConflicts
+					// This is a schema change conflict and has already been handled by checkSchemaConflicts
 				} else if theirsChanged {
-					mergedColumns = append(mergedColumns, *theirs)
+					// In this case, only theirsChanged, so we need to check if moving from ours->theirs
+					// is valid, otherwise it's a conflict
+					if compatChecker.IsTypeChangeCompatible(ours.TypeInfo, theirs.TypeInfo) {
+						mergedColumns = append(mergedColumns, *theirs)
+					} else {
+						conflicts = append(conflicts, ColConflict{
+							Kind:   NameCollision,
+							Ours:   *ours,
+							Theirs: *theirs,
+						})
+					}
+				} else if oursChanged {
+					// In this case, only oursChanged, so we need to check if moving from theirs->ours
+					// is valid, otherwise it's a conflict
+					if compatChecker.IsTypeChangeCompatible(theirs.TypeInfo, ours.TypeInfo) {
+						mergedColumns = append(mergedColumns, *ours)
+					} else {
+						conflicts = append(conflicts, ColConflict{
+							Kind:   NameCollision,
+							Ours:   *ours,
+							Theirs: *theirs,
+						})
+					}
 				} else {
+					// if neither side changed, just use ours
 					mergedColumns = append(mergedColumns, *ours)
 				}
 			} else if ours.Equals(*theirs) {
@@ -387,9 +431,9 @@ func checkForColumnConflicts(mergedColumns []schema.Column) []ColConflict {
 	return conflicts
 }
 
-// checkColumnMappingsForConflicts iterates over |columnMappings| and returns any column schema conflicts from column
-// changes that can't be automatically merged.
-func checkColumnMappingsForConflicts(columnMappings columnMappings) ([]ColConflict, error) {
+// checkSchemaConflicts iterates over |columnMappings| and returns any column schema conflicts from column changes
+// that can't be automatically merged.
+func checkSchemaConflicts(columnMappings columnMappings) ([]ColConflict, error) {
 	var conflicts []ColConflict
 	for _, mapping := range columnMappings {
 		ours := mapping.ours
@@ -493,7 +537,6 @@ func newColumnMapping(anc, ours, theirs schema.Column) columnMapping {
 	return columnMapping{pAnc, pOurs, pTheirs}
 }
 
-// columnMappings is a slice of columnMapping instances.
 type columnMappings []columnMapping
 
 // DebugString returns a string representation of this columnMappings instance.
@@ -526,7 +569,7 @@ func (c columnMappings) DebugString() string {
 
 // mapColumns returns a columnMappings instance that describes how the columns in |ourCC|, |theirCC|, and |ancCC|
 // map to each other.
-func mapColumns(ourCC, theirCC, ancCC *schema.ColCollection) columnMappings {
+func mapColumns(ourCC, theirCC, ancCC *schema.ColCollection) (columnMappings, error) {
 	// Make a copy of theirCC so we can modify it to track which their columns we've matched
 	theirCC = schema.NewColCollection(theirCC.GetColumns()...)
 	theirTagsToCols := theirCC.TagToCol
@@ -552,221 +595,190 @@ func mapColumns(ourCC, theirCC, ancCC *schema.ColCollection) columnMappings {
 	})
 
 	// Handle any remaining columns on the "their" side
-	for _, theirCol := range theirTagsToCols {
-		ancCol, foundAncByTag := ancCC.GetByTag(theirCol.Tag)
+	_ = theirCC.Iter(func(tag uint64, theirCol schema.Column) (stop bool, err error) {
+		if _, ok := theirTagsToCols[tag]; !ok {
+			return // already added
+		}
+
+		ancCol, foundAncByTag := ancCC.GetByTag(tag)
 		if !foundAncByTag {
 			// Ditto for finding the ancestor column
 			ancCol, _ = ancCC.GetByNameCaseInsensitive(theirCol.Name)
 		}
-
 		columnMappings = append(columnMappings, newColumnMapping(ancCol, schema.InvalidCol, theirCol))
-	}
-
-	return columnMappings
+		return
+	})
+	return columnMappings, nil
 }
 
-// mergeIndexes merges the indexes from |ourSch|, |theirSch|, and |ancSch| into a single, merged collection of indexes,
-// or if problems are encountered merging the indexes, then a slice of IdxConflicts is returned describing the
-// conflicts that prevented the indexes from being merged together.
-func mergeIndexes(mergedCC *schema.ColCollection, ourSch, theirSch, ancSch schema.Schema) (schema.IndexCollection, []IdxConflict) {
-	// Calculate the index mappings between the three schemas
-	mappings := mapIndexes(ourSch.Indexes(), theirSch.Indexes(), ancSch.Indexes())
+// assumes indexes are unique over their column sets
+func mergeIndexes(mergedCC *schema.ColCollection, ourSch, theirSch, ancSch schema.Schema) (merged schema.IndexCollection, conflicts []IdxConflict) {
+	merged, conflicts = indexesInCommon(mergedCC, ourSch.Indexes(), theirSch.Indexes(), ancSch.Indexes())
 
-	// Then look for conflicts while merging the indexes together
-	var mergedIndexes []schema.Index
-	var conflicts []IdxConflict
-	for _, mapping := range mappings {
-		if mapping.anc == nil {
-			// if there's no ancestor...
-			switch {
-			case mapping.ours == nil && mapping.theirs == nil:
-				// no-op
-			case mapping.ours == nil && mapping.theirs != nil:
-				mergedIndexes = append(mergedIndexes, mapping.theirs)
-			case mapping.ours != nil && mapping.theirs == nil:
-				mergedIndexes = append(mergedIndexes, mapping.ours)
-			case mapping.ours != nil && mapping.theirs != nil:
-				if mapping.ours.Equals(mapping.theirs) {
-					mergedIndexes = append(mergedIndexes, mapping.ours)
-				} else {
-					conflicts = append(conflicts, IdxConflict{
-						Kind:   NameCollision,
-						Ours:   mapping.ours,
-						Theirs: mapping.theirs})
-				}
-			}
-		} else {
-			// if there is a common ancestor, then we need to see how each side changed from it...
-			switch {
-			case mapping.ours == nil && mapping.theirs == nil:
-				// no-op – index deleted on both sides
-			case mapping.ours == nil && mapping.theirs != nil:
-				if mapping.anc.Equals(mapping.theirs) == false {
-					// index deleted on our side, modified on theirs – conflict
-					conflicts = append(conflicts, IdxConflict{
-						Kind:   NameCollision,
-						Ours:   mapping.ours,
-						Theirs: mapping.theirs})
-				}
-			case mapping.ours != nil && mapping.theirs == nil:
-				if mapping.anc.Equals(mapping.ours) == false {
-					// index deleted on theirs side, modified on ours – conflict
-					conflicts = append(conflicts, IdxConflict{
-						Kind:   NameCollision,
-						Ours:   mapping.ours,
-						Theirs: mapping.theirs})
-				}
-			case mapping.ours != nil && mapping.theirs != nil:
-				oursChanged := !mapping.anc.Equals(mapping.ours)
-				theirsChanged := !mapping.anc.Equals(mapping.theirs)
+	ourNewIdxs := indexCollSetDifference(ourSch.Indexes(), ancSch.Indexes(), mergedCC)
+	theirNewIdxs := indexCollSetDifference(theirSch.Indexes(), ancSch.Indexes(), mergedCC)
 
-				if mapping.ours.Equals(mapping.theirs) {
-					mergedIndexes = append(mergedIndexes, mapping.ours)
-				} else if !oursChanged && !theirsChanged {
-					mergedIndexes = append(mergedIndexes, mapping.ours)
-				} else if !oursChanged && theirsChanged {
-					mergedIndexes = append(mergedIndexes, mapping.theirs)
-				} else if oursChanged && !theirsChanged {
-					mergedIndexes = append(mergedIndexes, mapping.ours)
-				} else if oursChanged && theirsChanged {
-					conflicts = append(conflicts, IdxConflict{
-						Kind:   NameCollision,
-						Ours:   mapping.ours,
-						Theirs: mapping.theirs})
-				}
-			}
-		}
-	}
-
-	// One more sanity check for conflicting index names
-	indexNames := make(map[string]schema.Index)
-	for _, idx := range mergedIndexes {
-		if _, ok := indexNames[idx.Name()]; ok {
+	// check for conflicts between indexes added on each branch since the ancestor
+	_ = ourNewIdxs.Iter(func(ourIdx schema.Index) (stop bool, err error) {
+		theirIdx, ok := theirNewIdxs.GetByNameCaseInsensitive(ourIdx.Name())
+		// If both indexes are exactly equal then there isn't a conflict
+		if ok && !ourIdx.DeepEquals(theirIdx) {
 			conflicts = append(conflicts, IdxConflict{
 				Kind:   NameCollision,
-				Ours:   indexNames[idx.Name()],
-				Theirs: idx,
+				Ours:   ourIdx,
+				Theirs: theirIdx,
 			})
-		} else {
-			indexNames[idx.Name()] = idx
 		}
-	}
-
-	mergedIndexCollection := schema.NewIndexCollection(mergedCC, nil)
-	mergedIndexCollection.AddIndex(mergedIndexes...)
-	return mergedIndexCollection, conflicts
-}
-
-// indexMappings is a slice of indexMapping instances.
-type indexMappings []indexMapping
-
-// DebugString returns a string representation of this indexMappings instance.
-func (i indexMappings) DebugString() string {
-	sb := strings.Builder{}
-	for _, mapping := range i {
-		if mapping.ours != nil {
-			sb.WriteString(fmt.Sprintf("  %s ", mapping.ours.Name()))
-		} else {
-			sb.WriteString("  --- ")
-		}
-		sb.WriteString(" -> ")
-		if mapping.theirs != nil {
-			sb.WriteString(fmt.Sprintf("  %s ", mapping.theirs.Name()))
-		} else {
-			sb.WriteString("  --- ")
-		}
-		sb.WriteString(" -> ")
-		if mapping.anc != nil {
-			sb.WriteString(fmt.Sprintf("  %s ", mapping.anc.Name()))
-		} else {
-			sb.WriteString("  --- ")
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}
-
-// indexMapping describes how a secondary index maps from one side of a merge to the other, and to a common ancestor, if
-// one exists.
-type indexMapping struct {
-	anc, ours, theirs schema.Index
-}
-
-// mapIndexes takes |ours|, |theirs|, and |anc| IndexCollections and determines how each index in each set maps
-// to the indexes in the other sets. It returns a slice of indexMapping instances that describe the relationships.
-func mapIndexes(ours, theirs, anc schema.IndexCollection) indexMappings {
-	var seenAnc = make(map[string]struct{})
-	var seenTheirs = make(map[string]struct{})
-	var mappings indexMappings
-
-	// Process all the indexes from |ours| first
-	ours.Iter(func(ourIdx schema.Index) (stop bool, err error) {
-		theirIndex := findMatchingIndex(ourIdx, theirs, seenTheirs)
-		ancIndex := findMatchingIndex(ourIdx, anc, seenAnc)
-		mappings = append(mappings, indexMapping{
-			anc:    ancIndex,
-			ours:   ourIdx,
-			theirs: theirIndex,
-		})
-
 		return false, nil
 	})
 
-	// Make sure anything left in |theirs| gets included
-	theirs.Iter(func(theirIdx schema.Index) (stop bool, err error) {
-		// Skip over any indexes from theirs that we've already matched
-		if _, alreadyMatched := seenTheirs[theirIdx.Name()]; alreadyMatched {
+	merged.AddIndex(ourNewIdxs.AllIndexes()...)
+	merged.AddIndex(theirNewIdxs.AllIndexes()...)
+
+	return merged, conflicts
+}
+
+func indexesInCommon(mergedCC *schema.ColCollection, ours, theirs, anc schema.IndexCollection) (common schema.IndexCollection, conflicts []IdxConflict) {
+	common = schema.NewIndexCollection(mergedCC, nil)
+	_ = ours.Iter(func(ourIdx schema.Index) (stop bool, err error) {
+		idxTags := ourIdx.IndexedColumnTags()
+		for _, t := range idxTags {
+			// if column doesn't exist anymore, drop index
+			// however, it shouldn't be possible for an index
+			// over a dropped column to exist in the intersection
+			if _, ok := mergedCC.GetByTag(t); !ok {
+				return false, nil
+			}
+		}
+
+		// Check that there aren't multiple indexes covering the same columns on "theirs"
+		theirIdx, idxConflict := findIndexInCollectionByTags(ourIdx, theirs)
+		if theirIdx == nil && idxConflict == nil {
+			return false, nil
+		} else if idxConflict != nil {
+			conflicts = append(conflicts, *idxConflict)
+			return true, nil
+		}
+
+		// Check that there aren't multiple indexes covering the same columns on "ours"
+		_, idxConflict = findIndexInCollectionByTags(ourIdx, ours)
+		if idxConflict != nil {
+			conflicts = append(conflicts, *idxConflict)
+			return true, nil
+		}
+
+		if ourIdx.Equals(theirIdx) {
+			common.AddIndex(ourIdx)
 			return false, nil
 		}
 
-		ancIndex := findMatchingIndex(theirIdx, anc, seenAnc)
-		mappings = append(mappings, indexMapping{
-			anc:    ancIndex,
-			ours:   nil,
-			theirs: theirIdx,
-		})
+		ancIdx, ok := anc.GetIndexByTags(idxTags...)
 
+		if !ok {
+			// index added on our branch and their branch with different defs, conflict
+			conflicts = append(conflicts, IdxConflict{
+				Kind:   TagCollision,
+				Ours:   ourIdx,
+				Theirs: theirIdx,
+			})
+			return false, nil
+		}
+
+		if ancIdx.Equals(theirIdx) {
+			// index modified on our branch
+			idx, ok := common.GetByNameCaseInsensitive(ourIdx.Name())
+			if ok {
+				conflicts = append(conflicts, IdxConflict{
+					Kind:   NameCollision,
+					Ours:   ourIdx,
+					Theirs: idx,
+				})
+			} else {
+				common.AddIndex(ourIdx)
+			}
+			return false, nil
+		}
+
+		if ancIdx.Equals(ourIdx) {
+			// index modified on their branch
+			idx, ok := common.GetByNameCaseInsensitive(theirIdx.Name())
+			if ok {
+				conflicts = append(conflicts, IdxConflict{
+					Kind:   NameCollision,
+					Ours:   idx,
+					Theirs: theirIdx,
+				})
+			} else {
+				common.AddIndex(theirIdx)
+			}
+			return false, nil
+		}
+
+		// index modified on our branch and their branch, conflict
+		conflicts = append(conflicts, IdxConflict{
+			Kind:   TagCollision,
+			Ours:   ourIdx,
+			Theirs: theirIdx,
+		})
 		return false, nil
 	})
-
-	return mappings
+	return common, conflicts
 }
 
-// findMatchingIndex searches |indexCollection| for an index that matches |target|. Exact matches are prioritized
-// first (i.e. same name, same column tags, same type). After finding exact matches, we fall back to checking for
-// renamed indexes (i.e. same column tags and type, but a different name). The |matchedNames| map is used to keep
-// track of what index names have been matched already, so that we don't match to the same index twice.
-// Note: this is not the ideal way to find the matching index. Having a stable, unique identifier that guarantees
-// the identity would make this logic trivial and more robust, but we don't have that yet for Indexes, so we must
-// use this heuristic.
-func findMatchingIndex(target schema.Index, indexCollection schema.IndexCollection, matchedNames map[string]struct{}) schema.Index {
-	candidates := indexCollection.GetIndexesByTags(target.IndexedColumnTags()...)
+// findIndexInCollectionByTags searches for a single index in |idxColl| that matches the same tags |idx| covers. If a
+// single matching index is found, then it is returned, along with no IdxConflict. If no matching index is found, then
+// nil is returned for both params. If multiple indexes are found that cover the same set of columns, a nil Index is
+// returned along with an IdxConflict that describes the conflict.
+//
+// Dolt allows you to add multiple indexes that cover the same set of columns, but in this situation, we aren't able
+// to always accurately match up the indexes between ours/theirs/anc in a merge. The set of column tags an
+// index covers was being used as a unique ID for the index, but as our index support has grown and in order to match
+// MySQL's behavior, this isn't guaranteed to be a unique identifier anymore.
+func findIndexInCollectionByTags(idx schema.Index, idxColl schema.IndexCollection) (schema.Index, *IdxConflict) {
+	theirIdxs := idxColl.GetIndexesByTags(idx.IndexedColumnTags()...)
+	switch len(theirIdxs) {
+	case 0:
+		return nil, nil
+	case 1:
+		return theirIdxs[0], nil
+	default:
+		sort.Slice(theirIdxs, func(i, j int) bool {
+			return theirIdxs[i].Name() < theirIdxs[j].Name()
+		})
 
-	// First check for an exact match, including name
-	for _, candidate := range candidates {
-		_, alreadyMatched := matchedNames[candidate.Name()]
-		if !alreadyMatched && target.Equals(candidate) {
-			matchedNames[candidate.Name()] = struct{}{}
-			return candidate
+		return nil, &IdxConflict{
+			Kind:   DuplicateIndexColumnSet,
+			Ours:   theirIdxs[0],
+			Theirs: theirIdxs[1],
 		}
 	}
-
-	// If we didn't find an exact match, fall back to checking for a match with a different name
-	for _, candidate := range candidates {
-		_, alreadyMatched := matchedNames[candidate.Name()]
-		if !alreadyMatched && target.EqualsIgnoreName(candidate) {
-			matchedNames[candidate.Name()] = struct{}{}
-			return candidate
-		}
-	}
-
-	return nil
 }
 
-func foreignKeysInCommon(ourFKs, theirFKs, ancFKs *doltdb.ForeignKeyCollection) (common *doltdb.ForeignKeyCollection, conflicts []FKConflict, err error) {
+func indexCollSetDifference(left, right schema.IndexCollection, cc *schema.ColCollection) (d schema.IndexCollection) {
+	d = schema.NewIndexCollection(cc, nil)
+	_ = left.Iter(func(idx schema.Index) (stop bool, err error) {
+		idxTags := idx.IndexedColumnTags()
+		for _, t := range idxTags {
+			// if column doesn't exist anymore, drop index
+			if _, ok := cc.GetByTag(t); !ok {
+				return false, nil
+			}
+		}
+
+		_, ok := right.GetIndexByTags(idxTags...)
+		if !ok {
+			d.AddIndex(idx)
+		}
+		return false, nil
+	})
+	return d
+}
+
+func foreignKeysInCommon(ourFKs, theirFKs, ancFKs *doltdb.ForeignKeyCollection, ancSchs map[string]schema.Schema) (common *doltdb.ForeignKeyCollection, conflicts []FKConflict, err error) {
 	common, _ = doltdb.NewForeignKeyCollection()
 	err = ourFKs.Iter(func(ours doltdb.ForeignKey) (stop bool, err error) {
-		theirs, ok := theirFKs.GetByTags(ours.TableColumns, ours.ReferencedTableColumns)
+
+		theirs, ok := theirFKs.GetMatchingKey(ours, ancSchs)
 		if !ok {
 			return false, nil
 		}
@@ -776,7 +788,7 @@ func foreignKeysInCommon(ourFKs, theirFKs, ancFKs *doltdb.ForeignKeyCollection) 
 			return false, err
 		}
 
-		anc, ok := ancFKs.GetByTags(ours.TableColumns, ours.ReferencedTableColumns)
+		anc, ok := ancFKs.GetMatchingKey(ours, ancSchs)
 		if !ok {
 			// FKs added on both branch with different defs
 			conflicts = append(conflicts, FKConflict{

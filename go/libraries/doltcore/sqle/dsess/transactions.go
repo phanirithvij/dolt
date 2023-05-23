@@ -15,6 +15,7 @@
 package dsess
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/vitess/go/mysql"
 	"github.com/sirupsen/logrus"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -44,6 +46,7 @@ var ErrUnresolvedConstraintViolationsCommit = errors.New("Committing this transa
 	"Constraint violations from a merge can be resolved using the dolt_constraint_violations table before committing the transaction. " +
 	"To allow transactions to be committed with constraint violations from a merge or transaction sequencing set @@dolt_force_transaction_commit=1.")
 
+// TODO: remove this
 func TransactionsDisabled(ctx *sql.Context) bool {
 	enabled, err := ctx.GetSessionVariable(ctx, TransactionsDisabledSysVar)
 	if err != nil {
@@ -73,6 +76,7 @@ func (d DisabledTransaction) IsReadOnly() bool {
 
 type DoltTransaction struct {
 	sourceDbName    string
+	startRootHash   map[string]hash.Hash
 	startState      *doltdb.WorkingSet
 	workingSetRef   ref.WorkingSetRef
 	dbData          env.DbData
@@ -88,6 +92,7 @@ type savepoint struct {
 
 func NewDoltTransaction(
 	dbName string,
+	startingRoots map[string]hash.Hash,
 	startState *doltdb.WorkingSet,
 	workingSet ref.WorkingSetRef,
 	dbData env.DbData,
@@ -96,6 +101,7 @@ func NewDoltTransaction(
 ) *DoltTransaction {
 	return &DoltTransaction{
 		sourceDbName:    dbName,
+		startRootHash:   startingRoots,
 		startState:      startState,
 		workingSetRef:   workingSet,
 		dbData:          dbData,
@@ -111,6 +117,11 @@ func (tx DoltTransaction) String() string {
 
 func (tx DoltTransaction) IsReadOnly() bool {
 	return tx.tCharacteristic == sql.ReadOnly
+}
+
+func (tx DoltTransaction) GetInitialRoot(dbName string) (hash.Hash, bool) {
+	h, ok := tx.startRootHash[strings.ToLower(dbName)]
+	return h, ok
 }
 
 var txLock sync.Mutex
@@ -207,7 +218,9 @@ func doltCommit(ctx *sql.Context,
 
 	workingSet = workingSet.ClearMerge()
 
-	newCommit, err := tx.dbData.Ddb.CommitWithWorkingSet(ctx, headRef, tx.workingSetRef, &pending, workingSet, currHash, tx.getWorkingSetMeta(ctx))
+	var rsc doltdb.ReplicationStatusController
+	newCommit, err := tx.dbData.Ddb.CommitWithWorkingSet(ctx, headRef, tx.workingSetRef, &pending, workingSet, currHash, tx.getWorkingSetMeta(ctx), &rsc)
+	WaitForReplicationController(ctx, rsc)
 	return workingSet, newCommit, err
 }
 
@@ -218,12 +231,80 @@ func txCommit(ctx *sql.Context,
 	workingSet *doltdb.WorkingSet,
 	hash hash.Hash,
 ) (*doltdb.WorkingSet, *doltdb.Commit, error) {
-	return workingSet, nil, tx.dbData.Ddb.UpdateWorkingSet(ctx, tx.workingSetRef, workingSet, hash, tx.getWorkingSetMeta(ctx))
+	var rsc doltdb.ReplicationStatusController
+	err := tx.dbData.Ddb.UpdateWorkingSet(ctx, tx.workingSetRef, workingSet, hash, tx.getWorkingSetMeta(ctx), &rsc)
+	WaitForReplicationController(ctx, rsc)
+	return workingSet, nil, err
 }
 
 // DoltCommit commits the working set and creates a new DoltCommit as specified, in one atomic write
 func (tx *DoltTransaction) DoltCommit(ctx *sql.Context, workingSet *doltdb.WorkingSet, commit *doltdb.PendingCommit) (*doltdb.WorkingSet, *doltdb.Commit, error) {
 	return tx.doCommit(ctx, workingSet, commit, doltCommit)
+}
+
+func WaitForReplicationController(ctx *sql.Context, rsc doltdb.ReplicationStatusController) {
+	if len(rsc.Wait) == 0 {
+		return
+	}
+	_, timeout, ok := sql.SystemVariables.GetGlobal(DoltClusterAckWritesTimeoutSecs)
+	if !ok {
+		return
+	}
+	timeoutI := timeout.(int64)
+	if timeoutI == 0 {
+		return
+	}
+
+	cCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(len(rsc.Wait))
+	for i, f := range rsc.Wait {
+		f := f
+		i := i
+		go func() {
+			defer wg.Done()
+			err := f(cCtx)
+			if err == nil {
+				rsc.Wait[i] = nil
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	waitFailed := false
+	select {
+	case <-time.After(time.Duration(timeoutI) * time.Second):
+		// We timed out before all the waiters were done.
+		// First we make certain to finalize everything.
+		cancel()
+		<-done
+		waitFailed = true
+	case <-done:
+		cancel()
+	}
+
+	// Just because our waiters all completed does not mean they all
+	// returned nil errors. Any non-nil entries in rsc.Wait returned an
+	// error. We turn those into warnings here.
+	numFailed := 0
+	for i, f := range rsc.Wait {
+		if f != nil {
+			numFailed += 1
+			if waitFailed {
+				rsc.NotifyWaitFailed[i]()
+			}
+		}
+	}
+	ctx.Session.Warn(&sql.Warning{
+		Level:   "Warning",
+		Code:    mysql.ERQueryTimeout,
+		Message: fmt.Sprintf("Timed out replication of commit to %d out of %d replicas.", numFailed, len(rsc.Wait)),
+	})
 }
 
 // doCommit commits this transaction with the write function provided. It takes the same params as DoltCommit

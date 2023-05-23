@@ -45,10 +45,10 @@ type IndexCollection interface {
 	GetByNameCaseInsensitive(indexName string) (Index, bool)
 	// GetIndexByColumnNames returns whether the collection contains an index that has this exact collection and ordering of columns.
 	GetIndexByColumnNames(cols ...string) (Index, bool)
-	// GetIndexByTags returns at most one index from this collection that covers the columns identified by the specified |tags|, in
-	// the same order. Note that this is NOT guaranteed to be the ONLY index in this collection that covers those same tags.
-	// Deprecated: Multiple indexes can cover the same column set; using this method can result in race conditions and errors
-	//             when multiple indexes cover the set of columns.
+	// GetIndexByTags returns whether the collection contains an index that has this exact collection and ordering of columns.
+	// Note that if an index collection contains multiple indexes that cover the same column tags (e.g. different index
+	// types) then this method will return one of them, but it is not guaranteed which one and can easily result in a
+	// race condition.
 	GetIndexByTags(tags ...uint64) (Index, bool)
 	// GetIndexesByTags returns all indexes from this collection that cover the same columns identified by |tags|, in the
 	// same order specified. This method is preferred over GetIndexByTags.

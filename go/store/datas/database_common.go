@@ -189,7 +189,21 @@ func (db *database) GetDataset(ctx context.Context, datasetID string) (Dataset, 
 	return db.datasetFromMap(ctx, datasetID, datasets)
 }
 
-func (db *database) GetDatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error) {
+func (db *database) GetDatasetByRootHash(ctx context.Context, datasetID string, rootHash hash.Hash) (Dataset, error) {
+	// precondition checks
+	if err := ValidateDatasetId(datasetID); err != nil {
+		return Dataset{}, fmt.Errorf("%w: %s", err, datasetID)
+	}
+
+	datasets, err := db.DatasetsByRootHash(ctx, rootHash)
+	if err != nil {
+		return Dataset{}, err
+	}
+
+	return db.datasetFromMap(ctx, datasetID, datasets)
+}
+
+func (db *database) DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error) {
 
 	if db.Format().UsesFlatbuffers() {
 		rm, err := db.loadDatasetsRefmap(ctx, rootHash)
@@ -268,7 +282,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) e
 	headType := newHead.TypeName()
 	switch headType {
 	case commitName:
-		iscommit, err := IsCommit(ctx, newVal)
+		iscommit, err := IsCommit(newVal)
 		if err != nil {
 			return err
 		}
@@ -291,7 +305,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) e
 		if err != nil {
 			return err
 		}
-		iscommit, err := IsCommit(ctx, commitval)
+		iscommit, err := IsCommit(commitval)
 		if err != nil {
 			return err
 		}
@@ -376,7 +390,7 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 	}
 
 	v := newHead.value()
-	iscommit, err := IsCommit(ctx, v)
+	iscommit, err := IsCommit(v)
 	if err != nil {
 		return err
 	}
@@ -384,7 +398,7 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 		return fmt.Errorf("FastForward: target value of new head address %v is not a commit.", newHeadAddr)
 	}
 
-	newCommit, err := commitFromValue(db.Format(), v)
+	newCommit, err := CommitFromValue(db.Format(), v)
 	if err != nil {
 		return err
 	}
@@ -392,7 +406,7 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 	currentHeadAddr, ok := ds.MaybeHeadAddr()
 	if ok {
 		currentHeadValue, _ := ds.MaybeHead()
-		currCommit, err := commitFromValue(db.Format(), currentHeadValue)
+		currCommit, err := CommitFromValue(db.Format(), currentHeadValue)
 		if err != nil {
 			return err
 		}
@@ -905,7 +919,7 @@ func (db *database) validateRefAsCommit(ctx context.Context, r types.Ref) (types
 	var v types.Value
 	v = rHead.(nomsHead).st
 
-	is, err := IsCommit(ctx, v)
+	is, err := IsCommit(v)
 
 	if err != nil {
 		return types.Struct{}, err

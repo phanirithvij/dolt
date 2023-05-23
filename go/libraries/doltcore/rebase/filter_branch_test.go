@@ -202,8 +202,11 @@ func filterBranchTests() []filterBranchTest {
 func setupFilterBranchTests(t *testing.T) *env.DoltEnv {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
+	cliCtx, err := cmd.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, err)
+
 	for _, c := range setupCommon {
-		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, nil)
+		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 		require.Equal(t, 0, exitCode)
 	}
 
@@ -214,14 +217,17 @@ func testFilterBranch(t *testing.T, test filterBranchTest) {
 	ctx := context.Background()
 	dEnv := setupFilterBranchTests(t)
 	defer dEnv.DoltDB.Close()
+	cliCtx, err := cmd.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, err)
+
 	for _, c := range test.setup {
-		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, nil)
+		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 		require.Equal(t, 0, exitCode)
 	}
 
 	for _, a := range test.asserts {
 		for _, c := range a.setup {
-			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, nil)
+			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 			require.Equal(t, 0, exitCode)
 		}
 

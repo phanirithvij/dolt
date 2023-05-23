@@ -46,18 +46,6 @@ var ErrInvalidTableName = errors.NewKind("Invalid table name %s. Table names mus
 var ErrReservedTableName = errors.NewKind("Invalid table name %s. Table names beginning with `dolt_` are reserved for internal use")
 var ErrSystemTableAlter = errors.NewKind("Cannot alter table %s: system tables cannot be dropped or altered")
 
-type SqlDatabase interface {
-	sql.Database
-	dsess.SessionDatabase
-	dsess.RevisionDatabase
-
-	// TODO: get rid of this, it's managed by the session, not the DB
-	GetRoot(*sql.Context) (*doltdb.RootValue, error)
-	DbData() env.DbData
-	Flush(*sql.Context) error
-	EditOptions() editor.Options
-}
-
 // Database implements sql.Database for a dolt DB.
 type Database struct {
 	name     string
@@ -70,7 +58,7 @@ type Database struct {
 	revType  dsess.RevisionType
 }
 
-var _ SqlDatabase = Database{}
+var _ dsess.SqlDatabase = Database{}
 var _ dsess.RevisionDatabase = Database{}
 var _ globalstate.StateProvider = Database{}
 var _ sql.CollatedDatabase = Database{}
@@ -92,6 +80,7 @@ type ReadOnlyDatabase struct {
 }
 
 var _ sql.ReadOnlyDatabase = ReadOnlyDatabase{}
+var _ dsess.SqlDatabase = ReadOnlyDatabase{}
 
 func (r ReadOnlyDatabase) IsReadOnly() bool {
 	return true
@@ -111,7 +100,7 @@ func (db Database) RevisionType() dsess.RevisionType {
 }
 
 func (db Database) BaseName() string {
-	base, _ := splitRevisionDbName(db)
+	base, _ := dsess.SplitRevisionDbName(db)
 	return base
 }
 
@@ -138,7 +127,7 @@ func NewDatabase(ctx context.Context, name string, dbData env.DbData, editOpts e
 
 // initialDBState returns the InitialDbState for |db|. Other implementations of SqlDatabase outside this file should
 // implement their own method for an initial db state and not rely on this method.
-func initialDBState(ctx *sql.Context, db SqlDatabase, branch string) (dsess.InitialDbState, error) {
+func initialDBState(ctx *sql.Context, db dsess.SqlDatabase, branch string) (dsess.InitialDbState, error) {
 	if len(db.Revision()) > 0 {
 		return initialStateForRevisionDb(ctx, db)
 	}
@@ -372,9 +361,9 @@ func (db Database) getTableInsensitive(ctx *sql.Context, head *doltdb.Commit, ds
 	case doltdb.SchemaConflictsTableName:
 		dt, found = dtables.NewSchemaConflictsTable(ctx, db.name, db.ddb), true
 	case doltdb.BranchesTableName:
-		dt, found = dtables.NewBranchesTable(ctx, db.ddb), true
+		dt, found = dtables.NewBranchesTable(ctx, db), true
 	case doltdb.RemoteBranchesTableName:
-		dt, found = dtables.NewRemoteBranchesTable(ctx, db.ddb), true
+		dt, found = dtables.NewRemoteBranchesTable(ctx, db), true
 	case doltdb.RemotesTableName:
 		dt, found = dtables.NewRemotesTable(ctx, db.ddb), true
 	case doltdb.CommitsTableName:
@@ -411,6 +400,12 @@ func (db Database) getTableInsensitive(ctx *sql.Context, head *doltdb.Commit, ds
 				dt, found = dtables.NewBranchNamespaceControlTable(controller.Namespace), true
 			}
 		}
+	case doltdb.IgnoreTableName:
+		backingTable, _, err := db.getTable(ctx, root, doltdb.IgnoreTableName)
+		if err != nil {
+			return nil, false, err
+		}
+		dt, found = dtables.NewIgnoreTable(ctx, db.ddb, backingTable), true
 	}
 
 	if found {
@@ -422,14 +417,17 @@ func (db Database) getTableInsensitive(ctx *sql.Context, head *doltdb.Commit, ds
 
 // resolveAsOf resolves given expression to a commit, if one exists.
 func resolveAsOf(ctx *sql.Context, db Database, asOf interface{}) (*doltdb.Commit, *doltdb.RootValue, error) {
-	head := db.rsr.CWBHeadRef()
+	head, err := db.rsr.CWBHeadRef()
+	if err != nil {
+		return nil, nil, err
+	}
 	switch x := asOf.(type) {
 	case time.Time:
 		return resolveAsOfTime(ctx, db.ddb, head, x)
 	case string:
-		return resolveAsOfCommitRef(ctx, db.ddb, head, x)
+		return resolveAsOfCommitRef(ctx, db, head, x)
 	default:
-		panic(fmt.Sprintf("unsupported AS OF type %T", asOf))
+		return nil, nil, fmt.Errorf("unsupported AS OF type %T", asOf)
 	}
 }
 
@@ -478,7 +476,9 @@ func resolveAsOfTime(ctx *sql.Context, ddb *doltdb.DoltDB, head ref.DoltRef, asO
 	return nil, nil, nil
 }
 
-func resolveAsOfCommitRef(ctx *sql.Context, ddb *doltdb.DoltDB, head ref.DoltRef, commitRef string) (*doltdb.Commit, *doltdb.RootValue, error) {
+func resolveAsOfCommitRef(ctx *sql.Context, db Database, head ref.DoltRef, commitRef string) (*doltdb.Commit, *doltdb.RootValue, error) {
+	ddb := db.ddb
+
 	if commitRef == doltdb.Working || commitRef == doltdb.Staged {
 		sess := dsess.DSessFromSess(ctx.Session)
 		root, _, _, err := sess.ResolveRootForRef(ctx, ctx.GetCurrentDatabase(), commitRef)
@@ -499,7 +499,12 @@ func resolveAsOfCommitRef(ctx *sql.Context, ddb *doltdb.DoltDB, head ref.DoltRef
 		return nil, nil, err
 	}
 
-	cm, err := ddb.Resolve(ctx, cs, head)
+	nomsRoot, err := dsess.TransactionRoot(ctx, db)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cm, err := ddb.ResolveByNomsRoot(ctx, cs, head, nomsRoot)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -643,6 +648,12 @@ func (db Database) GetRoot(ctx *sql.Context) (*doltdb.RootValue, error) {
 	return dbState.GetRoots().Working, nil
 }
 
+// GetWorkingSet gets the current working set for the database.
+// If there is no working set (most likely because the DB is in Detached Head mode, return an error.
+// If a command needs to work while in Detached Head, that command should call sess.LookupDbState directly.
+// TODO: This is a temporary measure to make sure that new commands that call GetWorkingSet don't unexpectedly receive
+// a null pointer. In the future, we should replace all uses of dbState.WorkingSet, including this, with a new interface
+// where users avoid handling the WorkingSet directly.
 func (db Database) GetWorkingSet(ctx *sql.Context) (*doltdb.WorkingSet, error) {
 	sess := dsess.DSessFromSess(ctx.Session)
 	dbState, ok, err := sess.LookupDbState(ctx, db.Name())
@@ -651,6 +662,9 @@ func (db Database) GetWorkingSet(ctx *sql.Context) (*doltdb.WorkingSet, error) {
 	}
 	if !ok {
 		return nil, fmt.Errorf("no root value found in session")
+	}
+	if dbState.WorkingSet == nil {
+		return nil, doltdb.ErrOperationNotSupportedInDetachedHead
 	}
 	return dbState.WorkingSet, nil
 }
@@ -1199,7 +1213,7 @@ func (db Database) GetEvent(ctx *sql.Context, name string) (sql.EventDefinition,
 	}
 
 	for _, frag := range frags {
-		if frag.name == strings.ToLower(name) {
+		if strings.ToLower(frag.name) == strings.ToLower(name) {
 			return sql.EventDefinition{
 				Name:            frag.name,
 				CreateStatement: frag.fragment,
@@ -1253,8 +1267,9 @@ func (db Database) DropEvent(ctx *sql.Context, name string) error {
 }
 
 // UpdateEvent implements sql.EventDatabase.
-func (db Database) UpdateEvent(ctx *sql.Context, ed sql.EventDefinition) error {
-	err := db.DropEvent(ctx, ed.Name)
+func (db Database) UpdateEvent(ctx *sql.Context, originalName string, ed sql.EventDefinition) error {
+	// TODO: any EVENT STATUS change should also update the branch-specific event scheduling
+	err := db.DropEvent(ctx, originalName)
 	if err != nil {
 		return err
 	}

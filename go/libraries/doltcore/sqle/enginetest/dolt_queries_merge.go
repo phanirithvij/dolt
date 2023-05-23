@@ -15,7 +15,6 @@
 package enginetest
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/enginetest/queries"
@@ -1606,6 +1605,56 @@ var Dolt1MergeScripts = []queries.ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "try to merge a nullable field into a non-null column",
+		SetUpScript: []string{
+			"SET dolt_force_transaction_commit = on;",
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(3,3);",
+			"call dolt_commit('-Am', 'new table with NULL value');",
+			"call dolt_checkout('-b', 'other')",
+			"insert into test values (2,NULL);",
+			"call dolt_commit('-am', 'inserted null value')",
+			"call dolt_checkout('main');",
+			"alter table test modify c0 int not null;",
+			"insert into test values (4,4)",
+			"call dolt_commit('-am', 'modified column c0 to not null');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('other')",
+				Expected: []sql.Row{{0, 1}},
+			},
+			{
+				Query:    "select * from dolt_constraint_violations",
+				Expected: []sql.Row{{"test", uint(1)}},
+			},
+			{
+				Query: "select violation_type, pk, violation_info from dolt_constraint_violations_test",
+				Expected: []sql.Row{
+					{uint16(4), 2, types.JSONDocument{Val: merge.NullViolationMeta{Columns: []string{"c0"}}}},
+				},
+			},
+		},
+	},
+	{
+		Name: "dolt_revert() detects not null violation (issue #4527)",
+		SetUpScript: []string{
+			"create table test2 (pk int primary key, c0 int)",
+			"insert into test2 values (1,1),(2,NULL),(3,3);",
+			"call dolt_commit('-Am', 'new table with NULL value');",
+			"delete from test2 where pk = 2;",
+			"call dolt_commit('-am', 'deleted row with NULL value');",
+			"alter table test2 modify c0 int not null",
+			"call dolt_commit('-am', 'modified column c0 to not null');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_revert('head~1');",
+				ExpectedErrStr: "revert currently does not handle constraint violations",
+			},
+		},
+	},
 }
 
 var KeylessMergeCVsAndConflictsScripts = []queries.ScriptTest{
@@ -2906,7 +2955,7 @@ var SchemaConflictScripts = []queries.ScriptTest{
 					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `c0` varchar(20),\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
 					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `c0` datetime(6),\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
 					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `c0` int,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
-					"",
+					"different column definitions for our column c0 and their column c0",
 				}},
 			},
 			{
@@ -3721,6 +3770,8 @@ var DoltVerifyConstraintsTestScripts = []queries.ScriptTest{
 var errTmplNoAutomaticMerge = "table %s can't be automatically merged.\nTo merge this table, make the schema on the source and target branch equal."
 
 var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
+
+	// Data conflicts during a merge with schema changes
 	{
 		Name: "data conflict",
 		AncSetUpScript: []string{
@@ -3760,51 +3811,8 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			},
 		},
 	},
-	{
-		Name: "unique constraint violation",
-		AncSetUpScript: []string{
-			"set autocommit = 0;",
-			"CREATE table t (pk varchar(100) primary key, col1 int, col2 varchar(100), UNIQUE KEY unique1 (col2));",
-			"INSERT into t values ('0', 0, '');",
-			"alter table t add index idx1 (pk, col2);",
-		},
-		RightSetUpScript: []string{
-			"alter table t drop column col1;",
-			"INSERT into t (pk, col2) values ('10', 'same');",
-		},
-		LeftSetUpScript: []string{
-			"INSERT into t values ('1', 10, 'same');",
-		},
-		Assertions: []queries.ScriptTestAssertion{
-			{
-				Query:    "call dolt_merge('right');",
-				Expected: []sql.Row{{0, 0x1}},
-			},
-			{
-				Query:    "select * from dolt_conflicts;",
-				Expected: []sql.Row{},
-			},
-			{
-				Query:    "select * from dolt_constraint_violations;",
-				Expected: []sql.Row{{"t", uint(2)}},
-			},
-			{
-				Query: "select violation_type, pk, col2, violation_info from dolt_constraint_violations_t;",
-				Expected: []sql.Row{
-					{uint(2), "1", "same", types.JSONDocument{Val: merge.UniqCVMeta{Columns: []string{"col2"}, Name: "unique1"}}},
-					{uint(2), "10", "same", types.JSONDocument{Val: merge.UniqCVMeta{Columns: []string{"col2"}, Name: "unique1"}}},
-				},
-			},
-			{
-				Query: "select pk, col2 from t;",
-				Expected: []sql.Row{
-					{"0", ""},
-					{"1", "same"},
-					{"10", "same"},
-				},
-			},
-		},
-	},
+
+	// Basic column changes – adds/drops/renames/reorders
 	{
 		Name: "dropping columns",
 		AncSetUpScript: []string{
@@ -4115,8 +4123,6 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			"alter table t add index idx4 (col1, col2);",
 			"alter table t add index idx5 (col2, col1);",
 			"alter table t add index idx6 (col2, pk, col1);",
-			// TODO: This duplicate index causes a race condition in the merge code
-			//"alter table t add index idx7 (col2);",
 		},
 		RightSetUpScript: []string{
 			"alter table t rename column col1 to col11;",
@@ -4202,6 +4208,84 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 	},
 	{
+		Name: "adding a column with a literal default value",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key);",
+			"INSERT into t values (1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t add column c1 varchar(100) default ('hello');",
+			"insert into t values (2, 'hi');",
+			"alter table t add index idx1 (c1, pk);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x0}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, "hello"}, {2, "hi"}, {3, "hello"}},
+			},
+		},
+	},
+	{
+		Name: "altering a column to add a literal default value",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key, c1 varchar(100));",
+			"INSERT into t values (1, NULL);",
+			"alter table t add index idx1 (c1, pk);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column c1 varchar(100) default ('hello');",
+			"insert into t values (2, DEFAULT);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3, NULL);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x0}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, nil}, {2, "hello"}, {3, nil}},
+			},
+		},
+	},
+	{
+		// TODO: We can currently only support literal default values. Supporting column references and functions
+		//       requires getting the analyzer involved to resolve references.
+		Name: "adding a column with a non-literal default value",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key);",
+			"INSERT into t values (1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t add column c1 varchar(100) default (CONCAT('h','e','l','l','o'));",
+			"insert into t values (2, 'hi');",
+			"alter table t add index idx1 (c1, pk);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "call dolt_merge('right');",
+				ExpectedErr: merge.ErrUnableToMergeColumnDefaultValue,
+			},
+			{
+				Skip:     true,
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, "hello"}, {2, "hi"}, {3, "hello"}},
+			},
+		},
+	},
+	{
 		Name: "adding different columns to both sides",
 		AncSetUpScript: []string{
 			"create table t (pk int primary key);",
@@ -4272,6 +4356,8 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			},
 		},
 	},
+
+	// Constraint changes
 	{
 		Name: "removing a not-null constraint",
 		AncSetUpScript: []string{
@@ -4399,6 +4485,51 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 	},
 	{
+		Name: "unique constraint violation",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE table t (pk varchar(100) primary key, col1 int, col2 varchar(100), UNIQUE KEY unique1 (col2));",
+			"INSERT into t values ('0', 0, '');",
+			"alter table t add index idx1 (pk, col2);",
+		},
+		RightSetUpScript: []string{
+			"alter table t drop column col1;",
+			"INSERT into t (pk, col2) values ('10', 'same');",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values ('1', 10, 'same');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from dolt_constraint_violations;",
+				Expected: []sql.Row{{"t", uint(2)}},
+			},
+			{
+				Query: "select violation_type, pk, col2, violation_info from dolt_constraint_violations_t;",
+				Expected: []sql.Row{
+					{uint(2), "1", "same", types.JSONDocument{Val: merge.UniqCVMeta{Columns: []string{"col2"}, Name: "unique1"}}},
+					{uint(2), "10", "same", types.JSONDocument{Val: merge.UniqCVMeta{Columns: []string{"col2"}, Name: "unique1"}}},
+				},
+			},
+			{
+				Query: "select pk, col2 from t;",
+				Expected: []sql.Row{
+					{"0", ""},
+					{"1", "same"},
+					{"10", "same"},
+				},
+			},
+		},
+	},
+	{
 		Name: "dropping a unique key",
 		AncSetUpScript: []string{
 			"create table t (pk int primary key, col1 int UNIQUE);",
@@ -4425,7 +4556,149 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 	},
 
-	// Schema conflict test cases
+	// Resolvable type changes
+	{
+		Name: "type widening - enums and sets",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key, col1 enum('blue', 'green'), col2 set('blue', 'green'));",
+			"INSERT into t values (1, 'blue', 'blue,green');",
+			"alter table t add index idx1 (col1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 enum('blue', 'green', 'red');",
+			"alter table t modify column col2 set('blue', 'green', 'red');",
+			"INSERT into t values (3, 'red', 'red,blue');",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (2, 'green', 'green,blue');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x0}},
+			},
+			{
+				Query: "select * from t order by pk;",
+				Expected: []sql.Row{
+					{1, uint64(1), uint64(3)},
+					{2, uint64(2), uint64(3)},
+					{3, uint64(3), uint64(5)},
+				},
+			},
+		},
+	},
+
+	// Schema conflicts
+	{
+		// Type widening - these changes move from smaller types to bigger types, so they are guaranteed to be safe.
+		// TODO: We don't support automatically converting column types in merges yet, so currently these won't
+		//       automatically merge and instead return schema conflicts.
+		Name: "type widening",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key, col1 enum('blue', 'green'), col2 float, col3 smallint, " +
+				"col4 decimal(4,2), col5 varchar(10), col6 set('a', 'b'), col7 bit(1));",
+			"INSERT into t values (1, 'blue', 1.0, 1, 0.1, 'one', 'a,b', 1);",
+			"alter table t add index idx1 (col1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 enum('blue', 'green', 'red');",
+			"alter table t modify column col2 double;",
+			"alter table t modify column col3 bigint;",
+			"alter table t modify column col4 decimal(8,4);",
+			"alter table t modify column col5 varchar(20);",
+			"alter table t modify column col6 set('a', 'b', 'c');",
+			"alter table t modify column col7 bit(2);",
+			"INSERT into t values (3, 'red', 3.0, 420, 0.001, 'three', 'a,b,c', 3);",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (2, 'green', 2.0, 2, 0.2, 'two', 'a,b', 1);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green'),\n  `col2` float,\n  `col3` smallint,\n  `col4` decimal(4,2),\n  `col5` varchar(10),\n  `col6` set('a','b'),\n  `col7` bit(1),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green','red'),\n  `col2` double,\n  `col3` bigint,\n  `col4` decimal(8,4),\n  `col5` varchar(20),\n  `col6` set('a','b','c'),\n  `col7` bit(2),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green'),\n  `col2` float,\n  `col3` smallint,\n  `col4` decimal(4,2),\n  `col5` varchar(10),\n  `col6` set('a','b'),\n  `col7` bit(1),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"}},
+			},
+		},
+	},
+	{
+		// Type shortening – these changes move from a larger type to a smaller type and are not always safe.
+		// For now, we automatically fail all of these with a schema conflict that the user must resolve, but in
+		// theory, we could try to apply these changes and see if the data in the tables is compatible or not, but
+		// that's an optimization left for the future. Until then, customers can manually alter their schema to
+		// get merges to work, based on the schema conflict information.
+		Name: "type shortening",
+		AncSetUpScript: []string{
+			"CREATE TABLE t (pk int primary key, col1 enum('blue','green','red'), col2 double, col3 bigint, col4 decimal(8,4), " +
+				"col5 varchar(20), col6 set('a','b','c'), col7 bit(2));",
+			"INSERT into t values (3, 'green', 3.0, 420, 0.001, 'three', 'a,b', 1);",
+			"alter table t add index idx1 (col1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 enum('blue', 'green');",
+			"alter table t modify column col2 float;",
+			"alter table t modify column col3 smallint;",
+			"alter table t modify column col4 decimal(4,2);",
+			"alter table t modify column col5 varchar(10);",
+			"alter table t modify column col6 set('a', 'b');",
+			"alter table t modify column col7 bit(1);",
+			"INSERT into t values (1, 'blue', 1.0, 1, 0.1, 'one', 'a,b', 1);",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (2, 'green', 2.0, 2, 0.2, 'two', 'a,b', 1);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green','red'),\n  `col2` double,\n  `col3` bigint,\n  `col4` decimal(8,4),\n  `col5` varchar(20),\n  `col6` set('a','b','c'),\n  `col7` bit(2),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green'),\n  `col2` float,\n  `col3` smallint,\n  `col4` decimal(4,2),\n  `col5` varchar(10),\n  `col6` set('a','b'),\n  `col7` bit(1),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` enum('blue','green','red'),\n  `col2` double,\n  `col3` bigint,\n  `col4` decimal(8,4),\n  `col5` varchar(20),\n  `col6` set('a','b','c'),\n  `col7` bit(2),\n  PRIMARY KEY (`pk`),\n  KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"}},
+			},
+		},
+	},
+	{
+		// Dolt indexes currently use the set of columns covered by the index, as a unique identifier for matching
+		// indexes on either side of a merge. As Dolt's index support has grown, this isn't guaranteed to be a unique
+		// id anymore, so instead of allowing a race condition in the merge logic, if we detect that multiple indexes
+		// cover the same set of columns, we return a schema conflict and let the user decide how to resolve it.
+		Name: "duplicate index tag set",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key, col1 varchar(100));",
+			"INSERT into t values (1, '100'), (2, '200');",
+			"alter table t add unique index idx1 (col1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t add index idx2 (col1(10));",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (3, '300');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema, description from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(100),\n  PRIMARY KEY (`pk`),\n  UNIQUE KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(100),\n  PRIMARY KEY (`pk`),\n  UNIQUE KEY `idx1` (`col1`),\n  KEY `idx2` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(100),\n  PRIMARY KEY (`pk`),\n  UNIQUE KEY `idx1` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"multiple indexes covering the same column set cannot be merged: 'idx1' and 'idx2'"}},
+			},
+		},
+	},
 	{
 		Name: "index conflicts: both sides add an index with the same name, same columns, but different type",
 		AncSetUpScript: []string{
@@ -4454,7 +4727,6 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			},
 		},
 	},
-
 	{
 		// https://github.com/dolthub/dolt/issues/2973
 		Name: "modifying a column on one side of a merge, and deleting it on the other",
@@ -4500,15 +4772,69 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			},
 		},
 	},
-
-	// Smarter merge conflict detection
 	{
-		// This merge tests reports a conflict on pk=1, because the tuple value is different on the left side, right
+		Name: "changing the type of a column",
+		AncSetUpScript: []string{
+			"create table t (pk int primary key, col1 int);",
+			"insert into t values (1, 10), (2, 20);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 varchar(100)",
+			"insert into t values (3, 'thirty'), (4, 'forty')",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (5, 50), (6, 60);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` int,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(100),\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` int,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"}},
+			},
+		},
+	},
+	{
+		Name: "changing the type of a column with an index",
+		AncSetUpScript: []string{
+			"create table t (pk int primary key, col1 int, INDEX col1_idx (col1));",
+			"insert into t values (1, 100), (2, 20);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 varchar(100);",
+			"insert into t values (3, 'thirty'), (4, 'forty')",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (5, 50), (6, 60);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` int,\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(100),\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` int,\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"}},
+			},
+		},
+	},
+
+	// Unsupported automatic merge cases
+	{
+		// This merge test reports a conflict on pk=1, because the tuple value is different on the left side, right
 		// side, and base. The value is the base is (10, '100'), on the right is nil, and on the left is ('100'),
 		// because the data migration for the schema change happens before the diff iterator is invoked.
 		// This should NOT be a conflict for a user – Dolt should not conflate the schema merge data migration with
 		// a real data conflict created by a user. Allowing this is still better than completely blocking all schema
-		// merges though, so we can live with this while we continue iterating and fine tuning schema merge logic.
+		// merges though, so we can live with this while we continue iterating and fine-tuning schema merge logic.
 		Name: "schema change combined with drop row",
 		AncSetUpScript: []string{
 			"SET autocommit = 0",
@@ -4542,11 +4868,40 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			},
 		},
 	},
-
-	// Unsupported automatic merge cases
 	{
-		Name: "adding a non-null column to one side",
+		Name: "adding a non-null column with a default value to one side",
 		AncSetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
+			"create table t (pk int primary key, col1 int);",
+			"insert into t values (1, 1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t add column col2 int not null default 0",
+			"alter table t add column col3 int;",
+			"insert into t values (2, 2, 2, null);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3, 3);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1, 0, nil}, {2, 2, 2, nil}, {3, 3, 0, nil}},
+			},
+			{
+				Query:    "select pk, violation_type from dolt_constraint_violations_t",
+				Expected: []sql.Row{},
+			},
+		},
+	},
+	{
+		Name: "adding a non-null column with a default value to one side (with update to existing row)",
+		AncSetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
 			"create table t (pk int primary key, col1 int);",
 			"insert into t values (1, 1);",
 		},
@@ -4561,83 +4916,25 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
+				SkipResultsCheck: true,
+				Query:            "call dolt_merge('right');",
+				Expected:         []sql.Row{{0, 0}}, // non-symmetric result
 			},
 			{
 				Skip:     true,
-				Query:    "select * from t;",
+				Query:    "select * from t;", // fails with row(1,1,0,NULL)
 				Expected: []sql.Row{{1, 1, 1, nil}, {2, 2, 2, nil}, {3, 3, 0, nil}},
 			},
-		},
-	},
-	{
-		Name: "changing the type of a column",
-		AncSetUpScript: []string{
-			"create table t (pk int primary key, col1 int);",
-			"insert into t values (1, 10), (2, 20);",
-		},
-		RightSetUpScript: []string{
-			"alter table t modify column col1 varchar(100)",
-			"insert into t values (3, 'thirty'), (4, 'forty')",
-		},
-		LeftSetUpScript: []string{
-			"insert into t values (5, 50), (6, 60);",
-		},
-		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
-			},
-			{
-				Query: "select pk, col1 from t;",
-				Expected: []sql.Row{
-					{1, "10"},
-					{2, "20"},
-					{3, "thirty"},
-					{4, "forty"},
-					{5, "50"},
-					{6, "60"},
-				},
-				Skip: true,
+				Query:    "select pk, violation_type from dolt_constraint_violations_t",
+				Expected: []sql.Row{},
 			},
 		},
 	},
 	{
-		Name: "changing the type of a column with an index",
+		Name: "adding a not-null constraint and default value to a column",
 		AncSetUpScript: []string{
-			"create table t (pk int primary key, col1 int, INDEX col1_idx (col1));",
-			"insert into t values (1, 100), (2, 20);",
-		},
-		RightSetUpScript: []string{
-			"alter table t modify column col1 varchar(100);",
-			"insert into t values (3, 'thirty'), (4, 'forty')",
-		},
-		LeftSetUpScript: []string{
-			"insert into t values (5, 50), (6, 60);",
-		},
-		Assertions: []queries.ScriptTestAssertion{
-			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
-			},
-			{
-				Skip:  true,
-				Query: "select pk, col1 from t order by col1;",
-				Expected: []sql.Row{
-					{1, "100"},
-					{2, "20"},
-					{3, "thirty"},
-					{4, "forty"},
-					{5, "50"},
-					{6, "60"},
-				},
-			},
-		},
-	},
-	{
-		Name: "adding a not-null constraint with default to a column",
-		AncSetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
 			"create table t (pk int primary key, col1 int);",
 			"insert into t values (1, null), (2, null);",
 		},
@@ -4651,19 +4948,23 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
 			},
 			{
-				Skip:  true,
 				Query: "select pk, col1 from t;",
 				Expected: []sql.Row{
 					{1, 9999},
 					{2, 9999},
 					{3, 30},
 					{4, 40},
-					{5, 9999},
-					{6, 9999},
+				},
+			},
+			{
+				Query: "select pk, violation_type from dolt_constraint_violations_t",
+				Expected: []sql.Row{
+					{5, uint16(4)},
+					{6, uint16(4)},
 				},
 			},
 		},
@@ -4671,6 +4972,7 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 	{
 		Name: "adding a not-null constraint to one side",
 		AncSetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
 			"create table t (pk int primary key, col1 int);",
 			"insert into t values (1, null), (2, null);",
 		},
@@ -4683,15 +4985,28 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
+			},
+			{
+				Query: "select pk, col1 from t;",
+				Expected: []sql.Row{
+					{1, 0},
+					{2, 0},
+				},
+			},
+			{
+				Query: "select violation_type, pk, violation_info from dolt_constraint_violations_t",
+				Expected: []sql.Row{
+					{uint16(4), 3, types.JSONDocument{Val: merge.NullViolationMeta{Columns: []string{"col1"}}}},
+				},
 			},
 		},
 	},
 	{
-		// It would make sense if we table-scanned for check constraints during merge
-		// and flagged failing constraints as violations in `dolt_constraint_violations`.
-		Name: "adding a check-constraint should abort the merge.",
+		// TODO: We should scan for check constraints during merge and flag failing
+		//       constraints as violations in `dolt_constraint_violations`.
+		Name: "adding a check-constraint",
 		AncSetUpScript: []string{
 			"create table t (pk int primary key, col1 int);",
 			"insert into t values (1, 1);",
@@ -4705,14 +5020,18 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Skip:           true,
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: "some schema error",
+				// TODO: Dolt currently merges this without an error, but it shouldn't;
+				//       There is a constraint violation that should be reported.
+				Skip:     true,
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 0x1}},
 			},
 		},
 	},
 	{
-		Name: "changing the collation of an indexed column is broken",
+		// TODO: Changing a column's collation requires rewriting the table and any indexes containing that column.
+		//       For now, we just detect the schema incompatibility and return schema conflict metadata.
+		Name: "changing the collation of an indexed column",
 		AncSetUpScript: []string{
 			"create table t (pk int primary key, col1 varchar(32) character set utf8mb4 collate utf8mb4_bin, index col1_idx (col1));",
 			"insert into t values (1, 'ab'), (2, 'Ab');",
@@ -4724,10 +5043,16 @@ var ThreeWayMergeWithSchemaChangeTestScripts = []MergeScriptTest{
 			"insert into t values (3, 'c');",
 		},
 		Assertions: []queries.ScriptTestAssertion{
-			// TODO: Fails secondary index validation. Changing the ordinal ordering of secondary indexes definitely breaks merge
 			{
-				Query:          "call dolt_merge('right');",
-				ExpectedErrStr: fmt.Sprintf(errTmplNoAutomaticMerge, "t"),
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{0, 1}},
+			},
+			{
+				Query: "select table_name, our_schema, their_schema, base_schema from dolt_schema_conflicts;",
+				Expected: []sql.Row{{"t",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(32) COLLATE utf8mb4_bin,\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(32) COLLATE utf8mb4_general_ci,\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+					"CREATE TABLE `t` (\n  `pk` int NOT NULL,\n  `col1` varchar(32) COLLATE utf8mb4_bin,\n  PRIMARY KEY (`pk`),\n  KEY `col1_idx` (`col1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"}},
 			},
 		},
 	},

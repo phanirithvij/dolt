@@ -112,8 +112,11 @@ func testGarbageCollection(t *testing.T, test gcTest) {
 	dEnv := dtestutils.CreateTestEnv()
 	defer dEnv.DoltDB.Close()
 
+	cliCtx, verr := commands.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, verr)
+
 	for _, c := range gcSetupCommon {
-		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, nil)
+		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 		require.Equal(t, 0, exitCode)
 	}
 
@@ -121,7 +124,7 @@ func testGarbageCollection(t *testing.T, test gcTest) {
 	for _, stage := range test.stages {
 		res = stage.preStageFunc(ctx, t, dEnv.DoltDB, res)
 		for _, c := range stage.commands {
-			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, nil)
+			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 			require.Equal(t, 0, exitCode)
 		}
 	}

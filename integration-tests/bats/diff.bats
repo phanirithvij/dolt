@@ -192,6 +192,79 @@ SQL
     [[ "$output" =~ "| > | modify2 | CREATE PROCEDURE modify2() SELECT 43 |" ]] || false
 }
 
+@test "diff: reverse diff" {
+    # We're not using the test table, so we might as well delete it
+    dolt sql <<SQL
+DROP TABLE test;
+CREATE TABLE tbl (PK BIGINT PRIMARY KEY);
+INSERT INTO tbl VALUES (1), (2), (3);
+DELIMITER //
+CREATE PROCEDURE modify1() BEGIN
+DECLARE a INT DEFAULT 1;
+SELECT a
+  AS RESULT;
+END//
+CREATE PROCEDURE modify2() SELECT 42;//
+CREATE PROCEDURE remove() BEGIN
+SELECT 8;
+END//
+SQL
+    dolt add -A
+    dolt commit -m "First commit"
+    dolt branch original
+
+    dolt sql <<SQL
+DELETE FROM tbl WHERE pk = 2;
+INSERT INTO tbl VALUES (4);
+DROP PROCEDURE modify1;
+DROP PROCEDURE modify2;
+DROP PROCEDURE remove;
+DELIMITER //
+CREATE PROCEDURE modify1() BEGIN
+SELECT 2
+  AS RESULTING
+  FROM DUAL;
+END//
+CREATE PROCEDURE modify2() SELECT 43;//
+CREATE PROCEDURE adding() BEGIN
+SELECT 9;
+END//
+SQL
+    dolt add -A
+    dolt commit -m "Second commit"
+
+    # Look at the context diff
+    run dolt diff original -R
+    [ "$status" -eq 0 ]
+    echo "$output"
+    # Verify that standard diffs are still working
+    [[ "$output" =~ "|   | PK |" ]] || false
+    [[ "$output" =~ "+---+----+" ]] || false
+    [[ "$output" =~ "| - | 4  |" ]] || false
+    [[ "$output" =~ "| + | 2  |" ]] || false
+    # Check the overall stored procedure diff (excluding dates since they're variable)
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+    [[ "$output" =~ "|   | name    | create_stmt                          |" ]] || false
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+    [[ "$output" =~ "| - | adding  | CREATE PROCEDURE adding() BEGIN      |" ]] || false
+    [[ "$output" =~ "|   |         | SELECT 9;                            |" ]] || false
+    [[ "$output" =~ "|   |         | END                                  |" ]] || false
+    [[ "$output" =~ "| * | modify1 |  CREATE PROCEDURE modify1() BEGIN    |" ]] || false
+    [[ "$output" =~ "|   |         | -SELECT 2                            |" ]] || false
+    [[ "$output" =~ "|   |         | -  AS RESULTING                      |" ]] || false
+    [[ "$output" =~ "|   |         | -  FROM DUAL;                        |" ]] || false
+    [[ "$output" =~ "|   |         | +DECLARE a INT DEFAULT 1;            |" ]] || false
+    [[ "$output" =~ "|   |         | +SELECT a                            |" ]] || false
+    [[ "$output" =~ "|   |         | +  AS RESULT;                        |" ]] || false
+    [[ "$output" =~ "|   |         |  END                                 |" ]] || false
+    [[ "$output" =~ "| < | modify2 | CREATE PROCEDURE modify2() SELECT 43 |" ]] || false
+    [[ "$output" =~ "| > | modify2 | CREATE PROCEDURE modify2() SELECT 42 |" ]] || false
+    [[ "$output" =~ "| + | remove  | CREATE PROCEDURE remove() BEGIN      |" ]] || false
+    [[ "$output" =~ "|   |         | SELECT 8;                            |" ]] || false
+    [[ "$output" =~ "|   |         | END                                  |" ]] || false
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+}
+
 @test "diff: clean working set" {
     dolt add .
     dolt commit -m table
@@ -698,23 +771,35 @@ SQL
     [[ "$output" =~ 'resolved foreign key' ]] || false
 }
 
-@test "diff: existing foreign key is resolved" {
+@test "diff: resolved FKs don't show up in diff results" {
     dolt sql <<SQL
-set foreign_key_checks=0;
-create table parent (i int primary key);
-create table child (j int primary key, constraint fk foreign key (j) references parent (i));
+SET @@foreign_key_checks=0;
+CREATE TABLE dept_emp (
+  emp_no int NOT NULL,
+  dept_no char(4) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+  PRIMARY KEY (emp_no,dept_no),
+  KEY dept_no (dept_no),
+  CONSTRAINT dept_emp_ibfk_1 FOREIGN KEY (emp_no) REFERENCES employees (emp_no) ON DELETE CASCADE
+);
+CREATE TABLE employees (
+  emp_no int NOT NULL,
+  nickname varchar(100),
+  PRIMARY KEY (emp_no)
+);
+insert into employees values (100, "bob");
+insert into dept_emp values (100, 1);
 SQL
-    run dolt diff
-    [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    dolt commit -Am "Importing data, with unresolved FKs"
 
-    dolt add -A
-    dolt commit -m "init commit"
-    dolt sql -q "delete from parent where i = 0"
+    # update a row to trigger FKs to be resolved
+    dolt sql -q "UPDATE employees SET nickname = 'bobby' WHERE emp_no = 100;"
+    dolt commit -am "Updating data, and resolving FKs"
 
-    run dolt diff
+    # check that the diff output doesn't mention FKs getting resolved or the dept_emp table
+    run dolt diff HEAD~ HEAD
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    ! [[ "$output" =~ "dept_emp" ]] || false
+    ! [[ "$output" =~ "resolved foreign key" ]] || false
 }
 
 @test "diff: with index and foreign key changes" {

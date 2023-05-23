@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -54,7 +55,13 @@ type MultiRepoEnv struct {
 	envs           []NamedEnv
 	fs             filesys.Filesys
 	cfg            config.ReadWriteConfig
+	dialProvider   dbfactory.GRPCDialProvider
 	ignoreLockFile bool
+}
+
+// NewMultiEnv returns a new MultiRepoEnv instance dirived from a root DoltEnv instance.
+func MultiEnvForSingleEnv(ctx context.Context, env *DoltEnv) (*MultiRepoEnv, error) {
+	return MultiEnvForDirectory(ctx, env.Config.WriteableConfig(), env.FS, env.Version, env.IgnoreLockFile, env)
 }
 
 // MultiEnvForDirectory returns a MultiRepoEnv for the directory rooted at the file system given. The doltEnv from the
@@ -63,45 +70,50 @@ type MultiRepoEnv struct {
 func MultiEnvForDirectory(
 	ctx context.Context,
 	config config.ReadWriteConfig,
-	fs filesys.Filesys,
+	dataDirFS filesys.Filesys,
 	version string,
 	ignoreLockFile bool,
 	dEnv *DoltEnv,
 ) (*MultiRepoEnv, error) {
-	mrEnv := &MultiRepoEnv{
-		envs:           make([]NamedEnv, 0),
-		fs:             fs,
-		cfg:            config,
-		ignoreLockFile: ignoreLockFile,
-	}
+	// Load current dataDirFS and put into mr env
+	var dbName string = "dolt"
+	var newDEnv *DoltEnv = dEnv
 
-	// Load current fs and put into mr env
-	var dbName string
-	if _, ok := fs.(*filesys.InMemFS); ok {
-		dbName = "dolt"
-	} else {
-		path, err := fs.Abs("")
+	// InMemFS is used only for testing.
+	// All other FS Types should get a newly created Environment which will serve as the primary env in the MultiRepoEnv
+	if _, ok := dataDirFS.(*filesys.InMemFS); !ok {
+		path, err := dataDirFS.Abs("")
 		if err != nil {
 			return nil, err
 		}
 		envName := getRepoRootDir(path, string(os.PathSeparator))
 		dbName = dirToDBName(envName)
+
+		newDEnv = Load(ctx, GetCurrentUserHomeDir, dataDirFS, doltdb.LocalDirDoltDB, version)
+	}
+
+	mrEnv := &MultiRepoEnv{
+		envs:           make([]NamedEnv, 0),
+		fs:             dataDirFS,
+		cfg:            config,
+		dialProvider:   NewGRPCDialProviderFromDoltEnv(newDEnv),
+		ignoreLockFile: ignoreLockFile,
 	}
 
 	envSet := map[string]*DoltEnv{}
-	if dEnv.Valid() {
-		envSet[dbName] = dEnv
+	if newDEnv.Valid() {
+		envSet[dbName] = newDEnv
 	}
 
 	// If there are other directories in the directory, try to load them as additional databases
-	fs.Iter(".", false, func(path string, size int64, isDir bool) (stop bool) {
+	dataDirFS.Iter(".", false, func(path string, size int64, isDir bool) (stop bool) {
 		if !isDir {
 			return false
 		}
 
 		dir := filepath.Base(path)
 
-		newFs, err := fs.WithWorkingDir(dir)
+		newFs, err := dataDirFS.WithWorkingDir(dir)
 		if err != nil {
 			return false
 		}
@@ -122,14 +134,19 @@ func MultiEnvForDirectory(
 	enforceSingleFormat(envSet)
 
 	// if the current directory database is in our set, add it first so it will be the current database
-	var ok bool
-	if dEnv, ok = envSet[dbName]; ok && dEnv.Valid() {
-		mrEnv.addEnv(dbName, dEnv)
+	if env, ok := envSet[dbName]; ok && env.Valid() {
+		mrEnv.addEnv(dbName, env)
 		delete(envSet, dbName)
 	}
 
-	for dbName, dEnv = range envSet {
-		mrEnv.addEnv(dbName, dEnv)
+	// get the keys from the envSet keys as a sorted list
+	sortedKeys := make([]string, 0, len(envSet))
+	for k := range envSet {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+	for _, dbName := range sortedKeys {
+		mrEnv.addEnv(dbName, envSet[dbName])
 	}
 
 	return mrEnv, nil
@@ -192,6 +209,11 @@ func MultiEnvForPaths(
 		} else if dEnv.CfgLoadErr != nil {
 			return nil, fmt.Errorf("error loading environment '%s' at path '%s': %s", name, absPath, dEnv.CfgLoadErr.Error())
 		}
+
+		if mrEnv.dialProvider == nil {
+			mrEnv.dialProvider = NewGRPCDialProviderFromDoltEnv(dEnv)
+		}
+
 		envSet[name] = dEnv
 	}
 
@@ -208,10 +230,7 @@ func (mrEnv *MultiRepoEnv) FileSystem() filesys.Filesys {
 }
 
 func (mrEnv *MultiRepoEnv) RemoteDialProvider() dbfactory.GRPCDialProvider {
-	for _, env := range mrEnv.envs {
-		return env.env
-	}
-	return NewGRPCDialProvider()
+	return mrEnv.dialProvider
 }
 
 func (mrEnv *MultiRepoEnv) Config() config.ReadWriteConfig {
