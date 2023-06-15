@@ -50,6 +50,16 @@ force_delete_main_branch_on_sqlserver() {
     [[ "$output" =~ "On branch to_keep" ]] || false
 }
 
+@test "deleted-branches: client can still connect to a database even when the db's default branch doesn't exist" {
+    make_it
+
+    dolt sql -q 'call dolt_checkout("to_keep"); call dolt_branch("-D", "main");'
+
+    run dolt sql -q "select * from dolt_branches;"
+    [ $status -eq 0 ]
+    [[ ! "$output" =~ "main" ]] || false
+}
+
 @test "deleted-branches: dolt_checkout() from sql-server doesn't panic when the db's default branch doesn't exist" {
     make_it
     start_sql_server "dolt_repo_$$"
