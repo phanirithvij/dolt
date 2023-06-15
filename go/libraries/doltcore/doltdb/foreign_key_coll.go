@@ -23,6 +23,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/utils/set"
@@ -328,9 +330,11 @@ func (fkc *ForeignKeyCollection) AddKeys(fks ...ForeignKey) error {
 		if key.Name == "" {
 			// assign a name based on the hash
 			// 8 char = 5 base32 bytes, should be collision resistant
-			// TODO: constraint names should be unique, and this isn't guaranteed to be.
+			// TODO: FK constraint names should be unique across the entire database, and this isn't guaranteed to be.
 			//  This logic needs to live at the table / DB level.
-			key.Name = key.HashOf().String()[:8]
+			// TODO: As a short term hack... just use a UUID in addition to part of the key hash
+			uuid := uuid.New()
+			key.Name = key.HashOf().String()[:5] + "-" + uuid.String()
 		}
 
 		if _, ok := fkc.GetByNameCaseInsensitive(key.Name); ok {
