@@ -160,10 +160,10 @@ func mergeProllyTableData(ctx *sql.Context, tm *TableMerger, finalSch schema.Sch
 		return nil, nil, err
 	}
 
-	checkValidator, err := newCheckValidator(ctx, tm, valueMerger, finalSch, artEditor)
-	if err != nil {
-		return nil, nil, err
-	}
+	//checkValidator, err := newCheckValidator(ctx, tm, valueMerger, finalSch, artEditor)
+	//if err != nil {
+	//	return nil, nil, err
+	//}
 
 	// validator shares an artifact editor with conflict merge
 	uniq, err := newUniqValidator(ctx, finalSch, tm, valueMerger, artEditor)
@@ -202,11 +202,11 @@ func mergeProllyTableData(ctx *sql.Context, tm *TableMerger, finalSch schema.Sch
 			continue
 		}
 
-		cnt, err = checkValidator.validateDiff(ctx, diff)
-		if err != nil {
-			return nil, nil, err
-		}
-		s.ConstraintViolations += cnt
+		//cnt, err = checkValidator.validateDiff(ctx, diff)
+		//if err != nil {
+		//	return nil, nil, err
+		//}
+		//s.ConstraintViolations += cnt
 
 		switch diff.Op {
 		case tree.DiffOpDivergentModifyConflict, tree.DiffOpDivergentDeleteConflict:
