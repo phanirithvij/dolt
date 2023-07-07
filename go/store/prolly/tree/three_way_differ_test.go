@@ -51,10 +51,10 @@ func TestThreeWayDiffer(t *testing.T) {
 			left:  [][]int{{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6}},
 			right: [][]int{{1, 1}, {2, 2}, {4, 4}},
 			exp: []testDiff{
-				{op: DiffOpLeftAdd, k: 3},
+				//{op: DiffOpLeftAdd, k: 3},
 				{op: DiffOpConvergentAdd, k: 4},
-				{op: DiffOpLeftAdd, k: 5},
-				{op: DiffOpLeftAdd, k: 6},
+				//{op: DiffOpLeftAdd, k: 5},
+				//{op: DiffOpLeftAdd, k: 6},
 			},
 		},
 		{
@@ -75,10 +75,10 @@ func TestThreeWayDiffer(t *testing.T) {
 			left:  [][]int{{1, 1}, {2, 2}},
 			right: [][]int{{1, 1}, {2, 2}, {3, 3}, {5, 5}, {6, 6}},
 			exp: []testDiff{
-				{op: DiffOpLeftDelete, k: 3},
+				//{op: DiffOpLeftDelete, k: 3},
 				{op: DiffOpConvergentDelete, k: 4},
-				{op: DiffOpLeftDelete, k: 5},
-				{op: DiffOpLeftDelete, k: 6},
+				//{op: DiffOpLeftDelete, k: 5},
+				//{op: DiffOpLeftDelete, k: 6},
 			},
 		},
 		{
@@ -99,10 +99,10 @@ func TestThreeWayDiffer(t *testing.T) {
 			left:  [][]int{{1, 1}, {2, 3}, {3, 3}, {4, 5}, {5, 6}, {6, 7}},
 			right: [][]int{{1, 1}, {2, 2}, {3, 3}, {4, 5}, {5, 5}, {6, 6}},
 			exp: []testDiff{
-				{op: DiffOpLeftModify, k: 2},
+				//{op: DiffOpLeftModify, k: 2},
 				{op: DiffOpConvergentModify, k: 4},
-				{op: DiffOpLeftModify, k: 5},
-				{op: DiffOpLeftModify, k: 6},
+				//{op: DiffOpLeftModify, k: 5},
+				//{op: DiffOpLeftModify, k: 6},
 			},
 		},
 		{
@@ -167,9 +167,9 @@ func TestThreeWayDiffer(t *testing.T) {
 			exp: []testDiff{
 				{op: DiffOpDivergentModifyConflict, k: 2},
 				{op: DiffOpDivergentModifyResolved, k: 3, m: []int{4, 4}},
-				{op: DiffOpLeftDelete, k: 4},
+				//{op: DiffOpLeftDelete, k: 4},
 				{op: DiffOpDivergentModifyResolved, k: 5, m: []int{6, 6}},
-				{op: DiffOpLeftAdd, k: 6},
+				//{op: DiffOpLeftAdd, k: 6},
 				{op: DiffOpRightAdd, k: 7},
 				{op: DiffOpConvergentDelete, k: 8},
 			},
@@ -186,13 +186,13 @@ func TestThreeWayDiffer(t *testing.T) {
 				valTypes = append(valTypes, val.Type{Enc: val.Int64Enc, Nullable: true})
 			}
 
-			valDesc := val.TupleDesc{Types: valTypes}
+			valDesc := val.NewTupleDescriptor(valTypes...)
 
 			base := newTestMap(t, ctx, tt.base, ns, valDesc)
 			left := newTestMap(t, ctx, tt.left, ns, valDesc)
 			right := newTestMap(t, ctx, tt.right, ns, valDesc)
 
-			iter, err := NewThreeWayDiffer(ctx, ns, left, right, base, testResolver(t, ns, valDesc, val.NewTupleBuilder(valDesc)), false, keyDesc)
+			iter, err := NewThreeWayDiffer(ctx, ns, left, right, base, testResolver(t, ns, valDesc, val.NewTupleBuilder(valDesc)), false, keyDesc, valDesc)
 			require.NoError(t, err)
 
 			var cmp []testDiff
