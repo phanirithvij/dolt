@@ -17,14 +17,14 @@ package commands
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
 
@@ -36,6 +36,8 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 )
 
 var fwtStageName = "fwt"
@@ -287,6 +289,16 @@ func newLateBindingEngine(
 	return lateBinder, nil
 }
 
+// InterpolateAndRunQuery interpolates a query, executes it, and returns the result rows.
+// Since this method does not return a schema, this method should be used only for fire-and-forget types of queries.
+func InterpolateAndRunQuery(queryist cli.Queryist, sqlCtx *sql.Context, queryTemplate string, params ...interface{}) ([]sql.Row, error) {
+	query, err := dbr.InterpolateForDialect(queryTemplate, params, dialect.MySQL)
+	if err != nil {
+		return nil, fmt.Errorf("error interpolating query: %w", err)
+	}
+	return GetRowsForSql(queryist, sqlCtx, query)
+}
+
 func GetRowsForSql(queryist cli.Queryist, sqlCtx *sql.Context, query string) ([]sql.Row, error) {
 	schema, rowIter, err := queryist.Query(sqlCtx, query)
 	if err != nil {
@@ -298,16 +310,6 @@ func GetRowsForSql(queryist cli.Queryist, sqlCtx *sql.Context, query string) ([]
 	}
 
 	return rows, nil
-}
-
-// InterpolateAndRunQuery interpolates a query, executes it, and returns the result rows.
-// Since this method does not return a schema, this method should be used only for fire-and-forget types of queries.
-func InterpolateAndRunQuery(queryist cli.Queryist, sqlCtx *sql.Context, queryTemplate string, params ...interface{}) ([]sql.Row, error) {
-	query, err := dbr.InterpolateForDialect(queryTemplate, params, dialect.MySQL)
-	if err != nil {
-		return nil, fmt.Errorf("error interpolating query: %w", err)
-	}
-	return GetRowsForSql(queryist, sqlCtx, query)
 }
 
 // GetTinyIntColAsBool returns the value of a tinyint column as a bool
@@ -498,4 +500,24 @@ func GetDoltStatus(queryist cli.Queryist, sqlCtx *sql.Context) (stagedChangedTab
 	}
 
 	return stagedChangedTables, unstagedChangedTables, nil
+}
+
+// getJsonDocumentColAsString returns the value of a JSONDocument column as a string
+// This is necessary because Queryist may return a JSONDocument column as a JSONDocument (when using SQLEngine)
+// or as a string (when using ConnectionQueryist).
+func getJsonDocumentCol(sqlCtx *sql.Context, col interface{}) (types.JSONDocument, error) {
+	switch v := col.(type) {
+	case string:
+		var doc interface{}
+		err := json.Unmarshal([]byte(v), &doc)
+		if err != nil {
+			return types.JSONDocument{}, fmt.Errorf("error parsing JSONDocument %s: %w", v, err)
+		}
+		j := types.JSONDocument{Val: doc}
+		return j, nil
+	case types.JSONDocument:
+		return v, nil
+	default:
+		return types.JSONDocument{}, fmt.Errorf("unexpected type %T, was expecting JSONDocument or string", v)
+	}
 }
