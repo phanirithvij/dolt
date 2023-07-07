@@ -62,6 +62,42 @@ func init() {
 	}
 }
 
+// NM4 - Never ship this.
+func TestRandoPreparedBug(t *testing.T) {
+	var PreparedAsOfTest = queries.ScriptTest{
+		Name: "testing",
+		SetUpScript: []string{
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(2,2),(3,3);",
+			"call dolt_commit('-Am', 'seed table');",
+			"update test set c0 = 42 where pk = 2;",
+			"call dolt_commit('-am', 'answer of the universe: 42');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from test where pk = 2;",
+				Expected: []sql.Row{{2, 42}},
+			},
+			{
+				Query:    "select * from test as of 'HEAD' where pk = 2;",
+				Expected: []sql.Row{{2, 42}},
+			},
+			{
+				Query:    "select * from test as of 'HEAD~1' where pk = 2;",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	}
+
+	h1 := newDoltHarness(t)
+	defer h1.Close()
+	enginetest.TestScript(t, h1, PreparedAsOfTest)
+
+	h2 := newDoltHarness(t)
+	defer h2.Close()
+	enginetest.TestScriptPrepared(t, h2, PreparedAsOfTest)
+}
+
 func TestQueries(t *testing.T) {
 	h := newDoltHarness(t)
 	defer h.Close()
