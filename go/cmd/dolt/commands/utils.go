@@ -262,7 +262,9 @@ func newLateBindingEngine(
 
 		} else {
 			dbUser = DefaultUser
-			user := rawDb.GetUser(dbUser, config.ServerHost, false)
+			rd := rawDb.Reader()
+			user := rawDb.GetUser(rd, dbUser, config.ServerHost, false)
+			rd.Close()
 			if user != nil {
 				// Want to ensure that the user has an empty password. If it has a password, we'll error
 				err := passwordValidate(rawDb, salt, dbUser, nil)
@@ -272,7 +274,10 @@ func newLateBindingEngine(
 			}
 
 			// If the user doesn't exist, we'll create it with superuser privs.
-			rawDb.AddSuperUser(dbUser, config.ServerHost, "")
+			ed := rawDb.Editor()
+			rawDb.AddSuperUser(ed, dbUser, config.ServerHost, "")
+			// TODO: Persist?
+			ed.Close()
 		}
 
 		// Set client to specified user
