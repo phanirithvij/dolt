@@ -2779,7 +2779,9 @@ func TestThreeWayMergeWithSchemaChangeScriptsPrepared(t *testing.T) {
 }
 
 // runMergeScriptTestsInBothDirections creates a new test run, named |name|, and runs the specified merge |tests|
-// in both directions (right to left merge, and left to right merge).
+// in both directions (right to left merge, and left to right merge). If
+// |runAsPrepared| is true then the test scripts will be run using the prepared
+// statement test code.
 func runMergeScriptTestsInBothDirections(t *testing.T, tests []MergeScriptTest, name string, runAsPrepared bool) {
 	t.Run(name, func(t *testing.T) {
 		t.Run("right to left merges", func(t *testing.T) {
