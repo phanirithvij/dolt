@@ -221,7 +221,7 @@ func Serve(
 			v.goldenMysqlConnectionString(),
 		)
 	} else {
-		mySQLServer, startError = server.NewServer(
+		mySQLServer, startError = server.NewPostgresServer( //TODO: for testing Postgres
 			serverConf,
 			sqlEngine.GetUnderlyingEngine(),
 			newSessionBuilder(sqlEngine, serverConfig),
@@ -242,6 +242,7 @@ func Serve(
 	ed = mysqlDb.Editor()
 	mysqlDb.AddSuperUser(ed, LocalConnectionUser, "localhost", serverLock.Secret)
 	ed.Close()
+	mysqlDb.SetEnabled(false) //TODO: for testing Postgres
 
 	var metSrv *http.Server
 	if serverConfig.MetricsHost() != "" && serverConfig.MetricsPort() > 0 {
