@@ -1543,6 +1543,10 @@ func (m *valueMerger) processColumn(i int, left, right, base val.Tuple) ([]byte,
 		rightCol = right.GetField(r)
 	}
 
+	if len(leftCol) != len(rightCol) {
+		return nil, true
+	}
+
 	if m.vD.Comparator().CompareValues(i, leftCol, rightCol, m.vD.Types[i]) == 0 {
 		return leftCol, false
 	}
