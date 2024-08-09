@@ -709,6 +709,13 @@ func (db Database) getTable(ctx *sql.Context, root doltdb.RootValue, tableName s
 		}
 	}
 
+	t, tblExists, err := db.checkForPgCatalogTable(ctx, tableName)
+	if err != nil {
+		return nil, false, err
+	} else if tblExists {
+		return t, tblExists, nil
+	}
+
 	tblName, tbl, tblExists, err := db.resolveUserTable(ctx, root, tableName)
 	if err != nil {
 		return nil, false, err
@@ -747,6 +754,27 @@ func (db Database) getTable(ctx *sql.Context, root doltdb.RootValue, tableName s
 	}
 
 	return table, true, nil
+}
+
+// checkForPgCatalogTable checks if the table is of pg_catalog schema
+// when the schema is not defined and the table name start with 'pg_'.
+func (db Database) checkForPgCatalogTable(ctx *sql.Context, tableName string) (sql.Table, bool, error) {
+	if resolve.UseSearchPath && db.schemaName == "" && strings.HasPrefix(strings.ToLower(tableName), "pg_") {
+		sdb, foundSch, err := db.GetSchema(ctx, "pg_catalog")
+		if err != nil {
+			return nil, false, err
+		}
+		if foundSch {
+			tbl, foundTbl, err := sdb.GetTableInsensitive(ctx, tableName)
+			if err != nil {
+				return nil, false, err
+			}
+			if foundTbl {
+				return tbl, foundTbl, nil
+			}
+		}
+	}
+	return nil, false, nil
 }
 
 // resolveUserTable returns the table with the given name from the root given. The table name is resolved in a
@@ -964,6 +992,13 @@ func (db Database) DropTable(ctx *sql.Context, tableName string) error {
 
 // dropTable drops the table with the baseName given, without any business logic checks
 func (db Database) dropTable(ctx *sql.Context, tableName string) error {
+	_, tblExists, err := db.checkForPgCatalogTable(ctx, tableName)
+	if err != nil {
+		return err
+	} else if tblExists {
+		return sql.ErrDropTableNotSupported.New("pg_catalog")
+	}
+
 	ds := dsess.DSessFromSess(ctx.Session)
 	if _, ok := ds.GetTemporaryTable(ctx, db.Name(), tableName); ok {
 		ds.DropTemporaryTable(ctx, db.Name(), tableName)
@@ -1762,7 +1797,7 @@ func (db Database) doltSchemaTableHash(ctx *sql.Context) (hash.Hash, error) {
 func (db Database) createEventDefinitionFromFragment(ctx *sql.Context, frag schemaFragment) (*sql.EventDefinition, error) {
 	b := planbuilder.New(ctx, db.getCatalog(ctx), sql.NewMysqlParser())
 	b.SetParserOptions(sql.NewSqlModeFromString(frag.sqlMode).ParserOptions())
-	parsed, _, _, err := b.Parse(updateEventStatusTemporarilyForNonDefaultBranch(db.revision, frag.fragment), false)
+	parsed, _, _, _, err := b.Parse(updateEventStatusTemporarilyForNonDefaultBranch(db.revision, frag.fragment), false)
 	if err != nil {
 		return nil, err
 	}
@@ -1794,10 +1829,12 @@ func (db Database) getCatalog(ctx *sql.Context) *analyzer.Catalog {
 
 // SaveEvent implements sql.EventDatabase.
 func (db Database) SaveEvent(ctx *sql.Context, event sql.EventDefinition) (bool, error) {
-	// If the database is not the default branch database, then the event is disabled.
+	// If the database is NOT on the DefaultInitBranch, then we disable the event, since
+	// events only run from a single branch. We check this by looking at the database's
+	// revision and ensuring it either matches DefaultInitBranch or is empty.
 	// TODO: need better way to determine the default branch; currently it checks only 'main'
-	if db.revision != env.DefaultInitBranch && event.Status == sql.EventStatus_Enable.String() {
-		// using revision database name
+	if (db.revision != env.DefaultInitBranch && db.revision != "") && event.Status == sql.EventStatus_Enable.String() {
+		ctx.GetLogger().Debugf("disabling event %s (db.revision == %s)", event.Name, db.revision)
 		event.Status = sql.EventStatus_Disable.String()
 		ctx.Session.Warn(&sql.Warning{
 			Level:   "Warning",
